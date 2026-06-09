@@ -18,15 +18,40 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from importlib import resources
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import config as cfgmod
 
 MAX_TOOL_ROUNDS = 8
 _STOP = object()  # sentinel: tell the host runner to stop
+
+# mantel binds loopback, but loopback alone doesn't stop a malicious web page in
+# the user's browser from POSTing to 127.0.0.1 (DNS-rebinding / CSRF). Since the
+# server hosts MCP tools and mutates config, guard it: require a localhost Host
+# (defeats rebinding) and reject any cross-origin Origin (defeats CSRF).
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
+
+
+def _host_only(value: str) -> str:
+    value = value.strip()
+    if value.startswith("["):
+        return value.split("]", 1)[0] + "]"
+    return value.rsplit(":", 1)[0] if ":" in value else value
+
+
+class _LocalGuard(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if _host_only(request.headers.get("host", "")) not in _ALLOWED_HOSTS:
+            return JSONResponse({"error": "host not allowed"}, status_code=403)
+        origin = request.headers.get("origin")
+        if origin and (urlparse(origin).hostname or "") not in _ALLOWED_HOSTS:
+            return JSONResponse({"error": "cross-origin request refused"}, status_code=403)
+        return await call_next(request)
 
 
 async def _reload(app: FastAPI) -> int | None:
@@ -81,11 +106,15 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
         app.state.reload = reload_q
 
         async def runner():
-            h = _build_host(app.state.cfg)
-            if h is not None:
-                await h.start()
+            h = None
+            try:
+                h = _build_host(app.state.cfg)
+                if h is not None:
+                    await h.start()
+            except Exception:  # initial start failed — reload can retry later
+                h = None
             app.state.host = h
-            ready.set()
+            ready.set()  # ALWAYS — never deadlock startup on a bad/slow server
             while True:
                 item = await reload_q.get()
                 app.state.host = None
@@ -93,15 +122,23 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
                     await h.stop()
                 if item is _STOP:
                     return
-                h = _build_host(app.state.cfg)
-                if h is not None:
-                    await h.start()
+                try:
+                    h = _build_host(app.state.cfg)
+                    if h is not None:
+                        await h.start()
+                except Exception:
+                    h = None
                 app.state.host = h
                 if not item.done():
                     item.set_result(len(h.openai_tools()) if h else 0)
 
         task = asyncio.create_task(runner())
-        await ready.wait()  # don't accept requests until the initial host is up
+        # Don't accept requests until the host is up — but never block forever
+        # (per-server timeouts bound start(); this is a final backstop).
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=60.0)
+        except asyncio.TimeoutError:
+            pass
         try:
             yield
         finally:
@@ -112,6 +149,7 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
                 task.cancel()
 
     app = FastAPI(title="mantel", version="0.2.0", lifespan=lifespan)
+    app.add_middleware(_LocalGuard)
     app.state.cfg = cfg
     app.state.host = None
 
@@ -248,7 +286,8 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
                             args = {}
                         cid = call.get("id", "")
                         yield _tool_frame("call", cid, name, {"arguments": args})
-                        res = await host.call(name, args) if host else {"ok": False, "content": "no MCP host"}
+                        h = app.state.host  # read fresh — a concurrent reload may have swapped it
+                        res = await h.call(name, args) if h else {"ok": False, "content": "MCP host unavailable"}
                         yield _tool_frame("result", cid, name, res)
                         messages.append({"role": "tool", "tool_call_id": cid,
                                          "content": res.get("content", "")})

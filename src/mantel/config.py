@@ -122,4 +122,8 @@ def save(cfg: Config) -> Path:
             for n, s in cfg.mcp_servers.items()
         }
     p.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    try:
+        p.chmod(0o600)  # may hold provider API keys → owner-only
+    except OSError:
+        pass
     return p

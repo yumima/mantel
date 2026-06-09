@@ -15,7 +15,17 @@ def _client() -> TestClient:
     # exercising mantel's graceful-degradation paths without a running engine.
     cfg.provider = "hearth"
     cfg.providers = {"hearth": cfgmod.Provider(base_url="http://127.0.0.1:1/v1")}
-    return TestClient(create_app(cfg))
+    # base_url=localhost so the localhost-only guard accepts the request.
+    return TestClient(create_app(cfg), base_url="http://localhost")
+
+
+def test_local_guard_blocks_rebinding_and_csrf():
+    app = create_app(cfgmod.Config())
+    assert TestClient(app, base_url="http://evil.example.com").get("/api/health").status_code == 403
+    ok = TestClient(app, base_url="http://localhost")
+    assert ok.get("/api/health").status_code == 200
+    # cross-origin (CSRF) POST is refused even with a localhost Host
+    assert ok.post("/api/provider/hearth", headers={"origin": "http://evil.example.com"}).status_code == 403
 
 
 def test_index_serves_ui():

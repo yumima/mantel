@@ -110,6 +110,15 @@ providers:
   hearth: { type: openai, base_url: http://127.0.0.1:11435/v1 }
 ```
 
+## Security
+mantel binds **loopback only** and runs a **localhost guard** — a Host-header
+allowlist plus cross-origin refusal — so a malicious web page in your browser
+can't reach the server (DNS-rebinding / CSRF). That matters because the server
+executes MCP tools and mutates config. Tool execution is **deny-by-default**;
+note that `auto_approve` matches the **tool name the server reports**, so prefer
+specific names over broad globs and use `*` only for servers you fully trust.
+The config file (which may hold provider API keys) is written `0600`.
+
 ## Roadmap
 - **M0 — scaffold + chat-to-hearth** ✅
 - **M2 — MCP host + agent loop** ✅ — stdio servers, tool aggregation, the tool-calling loop, deny-by-default execution, live tool activity, a hearth-style management CLI (`setup` / `status` / `doctor` / `mcp` / `provider` / …).

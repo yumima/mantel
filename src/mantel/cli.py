@@ -31,10 +31,12 @@ def _server_url(cfg: cfgmod.Config) -> str:
 
 
 def _server_up(cfg: cfgmod.Config, timeout: float = 0.5) -> bool:
+    """True only if *mantel* is serving on the port — not some other app that
+    happens to answer /api/health (so we never reuse a foreign server)."""
     try:
-        return httpx.get(f"http://{cfg.host}:{cfg.port}/api/health",
-                         timeout=timeout).status_code == 200
-    except httpx.HTTPError:
+        r = httpx.get(f"http://{cfg.host}:{cfg.port}/api/health", timeout=timeout)
+        return r.status_code == 200 and r.json().get("app") == "mantel"
+    except (httpx.HTTPError, ValueError):
         return False
 
 
@@ -74,8 +76,9 @@ def _start_server_thread(cfg: cfgmod.Config) -> bool:
 def cmd_open(args: argparse.Namespace) -> int:
     cfg = cfgmod.load()
     if not _start_server_thread(cfg):
-        print("warning: mantel's local server didn't come up; the window may be blank.",
-              file=sys.stderr)
+        print(f"warning: mantel's server didn't come up on {cfg.host}:{cfg.port} "
+              f"(port already in use by another app?). Run `mantel serve` to see the "
+              f"error, or change `port` via `mantel config edit`.", file=sys.stderr)
     from . import desktop
     return desktop.open_window(_server_url(cfg))
 
@@ -214,7 +217,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     p = cfgmod.save(cfg)
     print(f"\n✓ wrote {p}")
-    print("Next:  mantel        # open the chat window")
+    try:
+        import webview  # type: ignore  # noqa: F401
+    except Exception:  # noqa: BLE001
+        print("\nTip: for a native window (instead of a Chromium --app window), install")
+        print("     pywebview:  pip install 'mantel[gui]'  (the chrome fallback works without it)")
+    print("\nNext:  mantel        # open the chat window")
     print("       mantel status # check backend + tools")
     return 0
 

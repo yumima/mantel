@@ -40,7 +40,7 @@ async def _fake_plain(prov, req):
 
 
 def _post_chat(app) -> str:
-    with TestClient(app) as client:  # `with` runs lifespan → starts the MCP host in this loop
+    with TestClient(app, base_url="http://localhost") as client:  # `with` runs lifespan → starts the MCP host in this loop
         with client.stream("POST", "/api/chat",
                            json={"model": "x", "messages": [{"role": "user", "content": "add 2 and 3"}]}) as r:
             return b"".join(r.iter_bytes()).decode("utf-8")
@@ -84,7 +84,7 @@ def test_enable_disable_server_live(monkeypatch, tmp_path):
     cfg = cfgmod.Config()
     cfg.mcp_servers = {"t": ServerConfig(command=sys.executable, args=[_SERVER],
                                          enabled=False, auto_approve=["add", "echo"])}
-    with TestClient(appmod.create_app(cfg)) as client:
+    with TestClient(appmod.create_app(cfg), base_url="http://localhost") as client:
         assert client.get("/api/tools").json()["tools"] == []          # disabled → no tools
         servers = client.get("/api/servers").json()["servers"]
         assert servers and servers[0]["name"] == "t" and servers[0]["enabled"] is False
@@ -100,7 +100,7 @@ def test_enable_disable_server_live(monkeypatch, tmp_path):
 
 def test_management_endpoint_errors(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    with TestClient(appmod.create_app(cfgmod.Config())) as client:
+    with TestClient(appmod.create_app(cfgmod.Config()), base_url="http://localhost") as client:
         assert client.post("/api/mcp/nope/enable").status_code == 404
         assert client.post("/api/provider/nope").status_code == 404
         assert client.post("/api/provider/hearth").json()["ok"] is True

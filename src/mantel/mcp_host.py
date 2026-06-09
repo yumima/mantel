@@ -15,6 +15,7 @@ is a later milestone; this is the safe floor.)
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import os
 import re
@@ -24,6 +25,8 @@ from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+_CONNECT_TIMEOUT = 20.0  # per-server cap on connect+initialize+list_tools
 
 
 @dataclass
@@ -70,11 +73,15 @@ class MCPHost:
                     command=sc.command, args=sc.args, env={**os.environ, **sc.env})
                 read, write = await self._stack.enter_async_context(stdio_client(params))
                 session = await self._stack.enter_async_context(ClientSession(read, write))
-                await session.initialize()
-                listed = await session.list_tools()
+                # Bound the handshake: a server that connects but never responds
+                # to initialize must not hang start() (and thus app startup).
+                await asyncio.wait_for(session.initialize(), timeout=_CONNECT_TIMEOUT)
+                listed = await asyncio.wait_for(session.list_tools(), timeout=_CONNECT_TIMEOUT)
                 self._sessions[name] = session
                 for t in listed.tools:
                     q = f"{_sanitize(name)}__{_sanitize(t.name)}"[:64]
+                    if q in self._tools:  # truncation/sanitize collision → disambiguate
+                        q = f"{q[:60]}_{len(self._tools)}"[:64]
                     self._tools[q] = _Tool(
                         server=name, name=t.name, description=t.description or "",
                         schema=t.inputSchema or {"type": "object"},
