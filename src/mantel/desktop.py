@@ -40,21 +40,32 @@ def open_window(url: str) -> int:
     except Exception as e:  # backend missing / no display — fall through
         print(f"(pywebview unavailable: {e}; falling back to a browser window)", file=sys.stderr)
 
-    # 2) Chromium/Edge --app= → still a chrome-less window, zero extra deps.
+    # 2) Chromium/Edge --app= → a chrome-less window. Use a DEDICATED profile so
+    # the launched binary is the window's own process, and BLOCK on it — mantel's
+    # server is a daemon thread in THIS process, so if we returned here the
+    # process would exit and the server would die under the window (→ connection
+    # refused). Closing the window unblocks us and mantel exits cleanly.
     browser = _app_mode_browser()
     if browser:
         try:
-            kwargs = {"start_new_session": True} if os.name == "posix" else {}
-            subprocess.Popen([*browser, f"--app={url}"], **kwargs)
-            print(f"opened Mantel in an app window ({Path(browser[0]).name}).")
+            profile = str(_user_data_dir() / "chrome-profile")
+            print(f"Mantel — app window via {Path(browser[0]).name}; close it to quit.")
+            proc = subprocess.Popen([*browser, f"--app={url}", f"--user-data-dir={profile}",
+                                     "--no-first-run", "--no-default-browser-check"])
+            proc.wait()
             return 0
         except OSError:
             pass
 
-    # 3) Last resort: a normal browser tab.
-    print(f"opening Mantel at {url} in your browser "
-          f"(install a webview for a standalone window: pip install 'mantel[gui]').")
+    # 3) Last resort: a normal browser tab. Block to keep the server alive.
+    import threading
+    print(f"Mantel is serving at {url} (no app-window backend — opened a browser tab).")
+    print("Leave this running; Ctrl-C to stop.")
     webbrowser.open(url)
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        pass
     return 0
 
 
