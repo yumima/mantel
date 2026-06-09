@@ -14,6 +14,7 @@ configured the loop runs once → it's a plain streaming chat.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from importlib import resources
@@ -25,6 +26,18 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from . import config as cfgmod
 
 MAX_TOOL_ROUNDS = 8
+_STOP = object()  # sentinel: tell the host runner to stop
+
+
+async def _reload(app: FastAPI) -> int | None:
+    """Ask the host runner to rebuild from the (already-mutated) config; returns
+    the new tool count, or None if there's no runner (e.g. a test-injected host)."""
+    rq = getattr(app.state, "reload", None)
+    if rq is None:
+        return None
+    fut = asyncio.get_running_loop().create_future()
+    await rq.put(fut)
+    return await fut
 
 
 class _BackendError(Exception):
@@ -51,15 +64,52 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        h = host if external_host else _build_host(cfg)
-        if h is not None and not external_host:
-            await h.start()
-        app.state.host = h
+        app.state.cfg = cfg
+        if external_host:
+            # Tests inject a pre-started host and manage its lifecycle themselves.
+            app.state.host = host
+            app.state.reload = None
+            yield
+            return
+
+        # The host's MCP sessions must be started, reloaded, and stopped in ONE
+        # long-lived task (anyio task-group contexts can't cross tasks). So a
+        # runner task owns them: it starts the host, then services reload/stop
+        # requests off a queue. Endpoints trigger reloads via _reload().
+        ready = asyncio.Event()
+        reload_q: asyncio.Queue = asyncio.Queue()
+        app.state.reload = reload_q
+
+        async def runner():
+            h = _build_host(app.state.cfg)
+            if h is not None:
+                await h.start()
+            app.state.host = h
+            ready.set()
+            while True:
+                item = await reload_q.get()
+                app.state.host = None
+                if h is not None:
+                    await h.stop()
+                if item is _STOP:
+                    return
+                h = _build_host(app.state.cfg)
+                if h is not None:
+                    await h.start()
+                app.state.host = h
+                if not item.done():
+                    item.set_result(len(h.openai_tools()) if h else 0)
+
+        task = asyncio.create_task(runner())
+        await ready.wait()  # don't accept requests until the initial host is up
         try:
             yield
         finally:
-            if h is not None and not external_host:
-                await h.stop()
+            await reload_q.put(_STOP)
+            try:
+                await asyncio.wait_for(task, timeout=10.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
 
     app = FastAPI(title="mantel", version="0.2.0", lifespan=lifespan)
     app.state.cfg = cfg
@@ -96,6 +146,39 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
                       for t in h.openai_tools()],
             "errors": h.errors,
         }
+
+    @app.get("/api/servers")
+    async def api_servers() -> dict:
+        c = app.state.cfg
+        h = app.state.host
+        return {"servers": [{"name": n, "enabled": s.enabled, "command": s.command,
+                             "args": s.args, "auto_approve": s.auto_approve}
+                            for n, s in c.mcp_servers.items()],
+                "errors": h.errors if h else {}}
+
+    @app.post("/api/mcp/{name}/{action}")
+    async def api_mcp(name: str, action: str) -> JSONResponse:
+        c = app.state.cfg
+        if name not in c.mcp_servers:
+            return JSONResponse({"error": f"no such server '{name}'"}, status_code=404)
+        if action not in ("enable", "disable"):
+            return JSONResponse({"error": "action must be enable or disable"}, status_code=400)
+        c.mcp_servers[name].enabled = (action == "enable")
+        cfgmod.save(c)                       # persist across restarts
+        tools = await _reload(app)           # apply live
+        h = app.state.host
+        return JSONResponse({"ok": True, "server": name, "enabled": c.mcp_servers[name].enabled,
+                             "tools": tools if tools is not None else (len(h.openai_tools()) if h else 0),
+                             "errors": h.errors if h else {}})
+
+    @app.post("/api/provider/{name}")
+    async def api_provider(name: str) -> JSONResponse:
+        c = app.state.cfg
+        if name not in c.providers:
+            return JSONResponse({"error": f"no such provider '{name}'"}, status_code=404)
+        c.provider = name                    # the chat loop reads active() per request → live
+        cfgmod.save(c)
+        return JSONResponse({"ok": True, "provider": name, "backend": c.active().base_url})
 
     @app.get("/api/models")
     async def api_models() -> JSONResponse:

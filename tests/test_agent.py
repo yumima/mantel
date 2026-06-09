@@ -77,3 +77,30 @@ def test_plain_chat_when_no_mcp_servers(monkeypatch):
     monkeypatch.setattr(appmod, "_backend_chat_stream", _fake_plain)
     body = _post_chat(appmod.create_app(cfgmod.Config()))   # no mcp_servers
     assert _answer(body) == "hello" and '"mantel_tool"' not in body
+
+
+def test_enable_disable_server_live(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))   # don't touch the real config
+    cfg = cfgmod.Config()
+    cfg.mcp_servers = {"t": ServerConfig(command=sys.executable, args=[_SERVER],
+                                         enabled=False, auto_approve=["add", "echo"])}
+    with TestClient(appmod.create_app(cfg)) as client:
+        assert client.get("/api/tools").json()["tools"] == []          # disabled → no tools
+        servers = client.get("/api/servers").json()["servers"]
+        assert servers and servers[0]["name"] == "t" and servers[0]["enabled"] is False
+
+        r = client.post("/api/mcp/t/enable").json()                    # enable → live reload
+        assert r["ok"] is True and r["enabled"] is True and r["tools"] >= 2
+        assert "t__add" in {x["name"] for x in client.get("/api/tools").json()["tools"]}
+
+        r2 = client.post("/api/mcp/t/disable").json()                  # disable → tools gone
+        assert r2["enabled"] is False and r2["tools"] == 0
+        assert client.get("/api/tools").json()["tools"] == []
+
+
+def test_management_endpoint_errors(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    with TestClient(appmod.create_app(cfgmod.Config())) as client:
+        assert client.post("/api/mcp/nope/enable").status_code == 404
+        assert client.post("/api/provider/nope").status_code == 404
+        assert client.post("/api/provider/hearth").json()["ok"] is True

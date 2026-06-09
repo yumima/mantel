@@ -95,6 +95,10 @@ mcp_servers:
 Any standard MCP **stdio** server works — `npx @modelcontextprotocol/server-*`,
 `uvx mcp-server-*`, or one of your own.
 
+**Manage it from the chat window** — no terminal needed. Type `/help`:
+`/tools`, `/servers`, `/enable <name>` / `/disable <name>` (applied **live** —
+no restart), `/provider <name>`, `/model <name>`, `/status`, `/clear`.
+
 ## Config
 `~/.config/mantel/config.yaml` (optional — absent ⇒ local hearth defaults):
 ```yaml

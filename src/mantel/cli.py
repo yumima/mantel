@@ -92,12 +92,20 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
 def _mantel_exec_argv() -> list[str]:
     """argv a launcher uses to invoke mantel — bare `mantel` opens the window.
-    Prefers a stable ~/.local/bin/mantel symlink (so venv rebuilds don't break
-    the launcher); falls back to `<python> -m mantel`."""
-    real = shutil.which("mantel")
-    if real:
-        return [_stable_link(os.path.realpath(real))]
-    return [os.path.realpath(sys.executable), "-m", "mantel"]
+    Prefers a `mantel` on PATH, else the console script next to this interpreter
+    (the venv's bin/mantel), routed through a stable ~/.local/bin/mantel symlink.
+    Falls back to ``<this python> -m mantel``.
+
+    NB: do NOT realpath the interpreter — a venv python is a symlink to the base
+    python, which doesn't have mantel (or its deps) installed."""
+    found = shutil.which("mantel")
+    if not found:
+        cand = Path(sys.executable).with_name("mantel")
+        if cand.exists():
+            found = str(cand)
+    if found:
+        return [_stable_link(os.path.realpath(found))]
+    return [sys.executable, "-m", "mantel"]
 
 
 def _stable_link(real: str) -> str:

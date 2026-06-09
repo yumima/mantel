@@ -199,7 +199,7 @@ document.addEventListener("click", (e) => {
 // ── backend plumbing (mantel's /api/* proxy) ──────────────────────────────────
 async function loadConfig(){
   try { const c = await (await fetch("/api/config")).json();
-    $("hint").textContent = `Enter to send · backend: ${c.provider} (${c.model}) · Shift+Enter for newline`;
+    $("hint").textContent = `Enter ⏎ to send · /help for commands · backend: ${c.provider} (${c.model})`;
     $("emptySub").textContent = `Talking to ${c.provider} — local-first, any backend.`;
   } catch {}
 }
@@ -229,9 +229,72 @@ function populateModels(data){
 
 function setSending(on){ streaming = on; const b = $("send"); b.classList.toggle("stop", on); b.textContent = on ? "■" : "↑"; b.title = on ? "Stop" : "Send"; }
 
+const SLASH_HELP = [
+  "<b>Commands</b> — manage MCP + the backend without leaving chat:",
+  "· <code>/tools</code> — list available tools",
+  "· <code>/servers</code> — list configured MCP servers",
+  "· <code>/enable &lt;server&gt;</code> · <code>/disable &lt;server&gt;</code> — toggle a server (live)",
+  "· <code>/provider &lt;name&gt;</code> — switch backend · <code>/model &lt;name&gt;</code> — switch model",
+  "· <code>/status</code> — backend, model, tool count · <code>/clear</code> — new chat · <code>/help</code>",
+].join("<br>");
+
+async function handleSlash(text){
+  const esc = escapeHtml;
+  const parts = text.slice(1).trim().split(/\s+/);
+  const cmd = (parts.shift() || "").toLowerCase();
+  const arg = parts.join(" ");
+  const sys = (html) => { addBubble("system").querySelector(".content").innerHTML = html; scrollDown(); };
+  try {
+    if (cmd === "" || cmd === "help") return sys(SLASH_HELP);
+    if (cmd === "clear" || cmd === "new") { history = []; $("thread").innerHTML = ""; setEmpty(true); return; }
+    if (cmd === "tools") {
+      const j = await (await fetch("/api/tools")).json();
+      if (!(j.tools || []).length) return sys("No tools yet. Enable a server: <code>/enable &lt;name&gt;</code> (see <code>/servers</code>).");
+      return sys("<b>Tools</b><br>" + j.tools.map(t => `· <code>${esc(t.name)}</code> — ${esc((t.description || "").slice(0, 80))}`).join("<br>"));
+    }
+    if (cmd === "servers" || cmd === "mcp") {
+      const j = await (await fetch("/api/servers")).json();
+      if (!(j.servers || []).length) return sys("No MCP servers configured. Add them via the config file, then <code>/enable</code>.");
+      return sys("<b>MCP servers</b><br>" + j.servers.map(s => `${s.enabled ? "🟢" : "⚪"} <code>${esc(s.name)}</code> — ${esc(s.command)} ${esc((s.args || []).join(" "))}`).join("<br>"));
+    }
+    if (cmd === "enable" || cmd === "disable") {
+      if (!arg) return sys(`Usage: <code>/${cmd} &lt;server&gt;</code>`);
+      const r = await fetch(`/api/mcp/${encodeURIComponent(arg)}/${cmd}`, { method: "POST" });
+      const j = await r.json();
+      if (!r.ok) return sys(`⚠ ${esc(j.error || "failed")}`);
+      refreshStatus();
+      const errs = Object.keys(j.errors || {}).length ? `<br>⚠ ${esc(JSON.stringify(j.errors))}` : "";
+      return sys(`${cmd === "enable" ? "🟢" : "⚪"} <code>${esc(arg)}</code> ${cmd}d — ${j.tools} tool(s) available now.${errs}`);
+    }
+    if (cmd === "provider") {
+      if (!arg) return sys("Usage: <code>/provider &lt;name&gt;</code>");
+      const r = await fetch(`/api/provider/${encodeURIComponent(arg)}`, { method: "POST" });
+      const j = await r.json();
+      if (r.ok) { loadConfig(); refreshStatus(); return sys(`Backend → <code>${esc(arg)}</code> (${esc(j.backend)}).`); }
+      return sys(`⚠ ${esc(j.error || "failed")}`);
+    }
+    if (cmd === "model") {
+      if (!arg) return sys("Usage: <code>/model &lt;name&gt;</code>");
+      model = arg; const sel = $("model"); if ([...sel.options].some(o => o.value === arg)) sel.value = arg;
+      return sys(`Model → <code>${esc(arg)}</code>.`);
+    }
+    if (cmd === "status") {
+      const c = await (await fetch("/api/config")).json();
+      return sys(`backend <code>${esc(c.provider)}</code> (${esc(c.backend)}) · model <code>${esc(c.model)}</code> · ${c.tools} tool(s)`);
+    }
+    sys(`Unknown command <code>/${esc(cmd)}</code> — try <code>/help</code>.`);
+  } catch (e) { sys(`⚠ ${esc(String(e.message || e))}`); }
+}
+
 async function send(){
   if (streaming) { controller?.abort(); return; }
   const text = $("input").value.trim(); if (!text) return;
+  if (text.startsWith("/")) {
+    $("input").value = ""; autogrow();
+    addBubble("user").querySelector(".content").textContent = text; scrollDown();
+    handleSlash(text);
+    return;
+  }
   $("input").value = ""; autogrow();
   history.push({ role: "user", content: text });
   addBubble("user").querySelector(".content").textContent = text; scrollDown();
