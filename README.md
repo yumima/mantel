@@ -95,9 +95,13 @@ mcp_servers:
 Any standard MCP **stdio** server works — `npx @modelcontextprotocol/server-*`,
 `uvx mcp-server-*`, or one of your own.
 
-**Manage it from the chat window** — no terminal needed. Type `/help`:
-`/tools`, `/servers`, `/enable <name>` / `/disable <name>` (applied **live** —
-no restart), `/provider <name>`, `/model <name>`, `/status`, `/clear`.
+**Manage it from the chat window** — no terminal needed. Type **`/`** for a
+command palette that filters as you type; pick a command and it completes the
+**argument too** — `/enable ` lists your servers (with on/off state), `/provider `
+your backends, `/model ` the available models — so there's nothing to memorize.
+↑/↓ to move, Enter/Tab to run, Esc to dismiss. Commands: `/tools`, `/servers`,
+`/enable` / `/disable` (applied **live**, no restart), `/provider`, `/model`,
+`/status`, `/clear`, `/help`.
 
 ## Config
 `~/.config/mantel/config.yaml` (optional — absent ⇒ local hearth defaults):

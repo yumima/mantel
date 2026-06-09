@@ -172,6 +172,7 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
         c = app.state.cfg
         h = app.state.host
         return {"provider": c.provider, "model": c.model, "backend": c.active().base_url,
+                "providers": list(c.providers.keys()),
                 "tools": len(h.openai_tools()) if h else 0}
 
     @app.get("/api/tools")

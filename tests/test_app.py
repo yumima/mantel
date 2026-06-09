@@ -47,6 +47,7 @@ def test_config_exposes_active_backend():
     assert body["provider"] == "hearth"
     assert body["model"]
     assert body["backend"].startswith("http://")
+    assert "hearth" in body["providers"]   # drives the /provider palette completion
 
 
 def test_models_degrades_gracefully_when_backend_down():
