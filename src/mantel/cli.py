@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -114,6 +115,230 @@ def _stable_link(real: str) -> str:
         return real
 
 
+# ── environment management (hearth-style) ─────────────────────────────────────
+
+
+def _probe_models(base_url: str) -> tuple[bool, list[dict]]:
+    """(reachable, models) from an OpenAI-compatible /models endpoint."""
+    try:
+        r = httpx.get(f"{base_url}/models", timeout=4.0)
+        if r.status_code == 200:
+            return True, (r.json().get("data") or [])
+    except (httpx.HTTPError, ValueError):
+        pass
+    return False, []
+
+
+def _mark(ok: bool) -> str:
+    return "✓" if ok else "✗"
+
+
+def _enumerate_tools(cfg: cfgmod.Config) -> tuple[list[dict], dict]:
+    """Start the configured MCP servers transiently to list their tools."""
+    if not cfg.mcp_servers:
+        return [], {}
+    import asyncio
+
+    from .mcp_host import MCPHost
+
+    async def go():
+        h = MCPHost(cfg.mcp_servers)
+        await h.start()
+        tools = [{"name": t["function"]["name"], "description": t["function"]["description"]}
+                 for t in h.openai_tools()]
+        errs = dict(h.errors)
+        await h.stop()
+        return tools, errs
+
+    try:
+        return asyncio.run(go())
+    except Exception as e:  # noqa: BLE001
+        return [], {"_": str(e)}
+
+
+def _live_or_transient_tools(cfg: cfgmod.Config) -> tuple[list[dict], dict]:
+    if _server_up(cfg):
+        try:
+            j = httpx.get(f"http://{cfg.host}:{cfg.port}/api/tools", timeout=5.0).json()
+            return j.get("tools", []), j.get("errors", {})
+        except (httpx.HTTPError, ValueError):
+            pass
+    return _enumerate_tools(cfg)
+
+
+def _example_mcp_servers() -> dict:
+    """A couple of safe, **disabled** examples to seed the config (Node/npx)."""
+    from .mcp_host import ServerConfig
+    home = str(Path.home())
+    return {
+        "filesystem": ServerConfig(
+            command="npx", args=["-y", "@modelcontextprotocol/server-filesystem", home],
+            enabled=False, auto_approve=["read_*", "list_*", "directory_*", "search_*"]),
+        "memory": ServerConfig(
+            command="npx", args=["-y", "@modelcontextprotocol/server-memory"],
+            enabled=False, auto_approve=["*"]),
+    }
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """First-run wizard: find a backend, pick a model, seed MCP examples."""
+    cfg = cfgmod.load()
+    print("mantel setup\n")
+    url = cfgmod.DEFAULT_HEARTH_URL
+    print(f"Looking for a local hearth engine at {url} …")
+    ok, models = _probe_models(url)
+    if ok:
+        cfg.provider = "hearth"
+        cfg.providers["hearth"] = cfgmod.Provider(base_url=url)
+        ids = [m.get("id") for m in models]
+        cfg.model = "primary_chat" if "primary_chat" in ids else (ids[0] if ids else "primary_chat")
+        print(f"  ✓ found hearth ({len(models)} models) — using model '{cfg.model}'")
+    else:
+        print("  · none found. Run a local hearth (github.com/yumima/hearth), or edit the")
+        print("    config to point at a cloud backend (`mantel config edit`).")
+
+    if not cfg.mcp_servers and shutil.which("npx"):
+        cfg.mcp_servers = _example_mcp_servers()
+        print("\nMCP: `npx` found — seeded two safe, disabled example servers")
+        print("     (filesystem, memory). Enable with `mantel mcp enable <name>`.")
+    elif not cfg.mcp_servers:
+        print("\nMCP: no `npx`/`uvx` runtime found — add servers later with `mantel config edit`.")
+
+    p = cfgmod.save(cfg)
+    print(f"\n✓ wrote {p}")
+    print("Next:  mantel        # open the chat window")
+    print("       mantel status # check backend + tools")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    cfg = cfgmod.load()
+    prov = cfg.active()
+    ok, models = _probe_models(prov.base_url)
+    print(f"mantel  ·  config: {cfgmod.config_path()}"
+          f"{'' if cfgmod.config_path().exists() else '  (defaults)'}")
+    print(f"  server:  http://{cfg.host}:{cfg.port}  "
+          f"({'running' if _server_up(cfg) else 'not running'})")
+    print(f"  backend: {cfg.provider} → {prov.base_url}  "
+          f"({str(len(models)) + ' models' if ok else 'unreachable'})")
+    print(f"  model:   {cfg.model}")
+    if not cfg.mcp_servers:
+        print("  mcp:     no servers (run `mantel setup` or `mantel config edit`)")
+    else:
+        enabled = [n for n, s in cfg.mcp_servers.items() if s.enabled]
+        print(f"  mcp:     {len(cfg.mcp_servers)} server(s), {len(enabled)} enabled"
+              + (f": {', '.join(enabled)}" if enabled else ""))
+        if enabled:
+            tools, errs = _live_or_transient_tools(cfg)
+            print(f"  tools:   {len(tools)} available"
+                  + (f"  ·  errors: {', '.join(errs)}" if errs else ""))
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    cfg = cfgmod.load()
+    print("mantel doctor — environment check\n")
+    ok, models = _probe_models(cfg.active().base_url)
+    print(f"  [{_mark(ok)}] backend  {cfg.provider} ({cfg.active().base_url})"
+          + (f" — {len(models)} models" if ok else " — unreachable"))
+    for rt, why in (("node", "needed for npx servers"), ("npx", "Node MCP servers"),
+                    ("uvx", "Python MCP servers (uv)")):
+        path = shutil.which(rt)
+        print(f"  [{_mark(bool(path))}] {rt:5} {('— ' + why):36}{path or 'missing'}")
+    try:
+        import webview  # type: ignore  # noqa: F401
+        have_pw = True
+    except Exception:  # noqa: BLE001
+        have_pw = False
+    have_chrome = any(shutil.which(b) for b in
+                      ("google-chrome", "chromium", "chromium-browser", "microsoft-edge", "brave-browser"))
+    print(f"  [{_mark(have_pw)}] window   pywebview (native)"
+          + ("" if have_pw else "  — pip install 'mantel[gui]'"))
+    print(f"  [{_mark(have_chrome)}] window   chromium/edge --app fallback")
+    return 0
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    cfg = cfgmod.load()
+    ok, models = _probe_models(cfg.active().base_url)
+    if not ok:
+        print(f"backend unreachable at {cfg.active().base_url}", file=sys.stderr)
+        return 1
+    for m in models:
+        print(f"  {m.get('id', ''):40s} {m.get('owned_by', '')}")
+    return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    p = cfgmod.config_path()
+    action = getattr(args, "action", None)
+    if action == "path":
+        print(p)
+        return 0
+    if action == "edit":
+        if not p.exists():
+            cfgmod.save(cfgmod.load())  # materialize defaults so there's something to edit
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano"
+        return subprocess.call([editor, str(p)])
+    if p.exists():
+        print(f"# {p}\n{p.read_text(encoding='utf-8').rstrip()}")
+    else:
+        print(f"# {p}  (defaults — not written yet; `mantel setup` or `mantel config edit` to create)")
+    return 0
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    cfg = cfgmod.load()
+    action = args.action
+    if action == "list":
+        if not cfg.mcp_servers:
+            print("no MCP servers configured  (run `mantel setup`).")
+            return 0
+        for n, s in cfg.mcp_servers.items():
+            print(f"  {'●' if s.enabled else '○'} {n:14s} {s.command} {' '.join(s.args)}")
+            if s.auto_approve:
+                print(f"      auto-approve: {', '.join(s.auto_approve)}")
+        return 0
+    if action == "tools":
+        tools, errs = _live_or_transient_tools(cfg)
+        for t in tools:
+            print(f"  {t['name']:34s} {t.get('description', '')[:60]}")
+        for n, e in errs.items():
+            print(f"  ! {n}: {e}", file=sys.stderr)
+        if not tools and not errs:
+            print("no tools — enable a server with `mantel mcp enable <name>`.")
+        return 0
+    if action in ("enable", "disable"):
+        if args.name not in cfg.mcp_servers:
+            print(f"no such server '{args.name}'  (see `mantel mcp list`)", file=sys.stderr)
+            return 1
+        cfg.mcp_servers[args.name].enabled = (action == "enable")
+        cfgmod.save(cfg)
+        print(f"✓ {args.name} {action}d — restart mantel to apply.")
+        return 0
+    print(f"unknown mcp action {action!r}", file=sys.stderr)
+    return 2
+
+
+def cmd_provider(args: argparse.Namespace) -> int:
+    cfg = cfgmod.load()
+    action = args.action
+    if action == "list":
+        for n, pr in cfg.providers.items():
+            print(f"  {'●' if n == cfg.provider else '○'} {n:12s} {pr.base_url}")
+        return 0
+    if action == "use":
+        if args.name not in cfg.providers:
+            print(f"no such provider '{args.name}'  (see `mantel provider list`)", file=sys.stderr)
+            return 1
+        cfg.provider = args.name
+        cfgmod.save(cfg)
+        print(f"✓ active provider → {args.name} — restart mantel to apply.")
+        return 0
+    print(f"unknown provider action {action!r}", file=sys.stderr)
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mantel",
@@ -121,11 +346,38 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_open)  # bare `mantel` opens the window
     sub = p.add_subparsers(dest="cmd")
 
+    sub.add_parser("setup", help="first-run wizard — find a backend, pick a model, seed MCP examples") \
+       .set_defaults(func=cmd_setup)
+
     s = sub.add_parser("serve", help="run the local server in the foreground (headless / dev)")
     s.add_argument("--log-level", default="info")
     s.set_defaults(func=cmd_serve)
 
     sub.add_parser("open", help="open the desktop chat window").set_defaults(func=cmd_open)
+    sub.add_parser("status", help="backend reachability, model, MCP servers + tools").set_defaults(func=cmd_status)
+    sub.add_parser("doctor", help="diagnose the environment (backend, MCP runtimes, window)").set_defaults(func=cmd_doctor)
+    sub.add_parser("models", help="list models from the active backend").set_defaults(func=cmd_models)
+
+    cf = sub.add_parser("config", help="show / edit the config file")
+    cf.add_argument("action", nargs="?", choices=["show", "path", "edit"], default="show")
+    cf.set_defaults(func=cmd_config)
+
+    mp = sub.add_parser("mcp", help="manage MCP servers")
+    mp_sub = mp.add_subparsers(dest="action", required=True)
+    mp_sub.add_parser("list", help="list configured servers")
+    mp_sub.add_parser("tools", help="list the tools the enabled servers expose")
+    for act in ("enable", "disable"):
+        sp = mp_sub.add_parser(act, help=f"{act} a server")
+        sp.add_argument("name")
+    mp.set_defaults(func=cmd_mcp)
+
+    pv = sub.add_parser("provider", help="manage backends")
+    pv_sub = pv.add_subparsers(dest="action", required=True)
+    pv_sub.add_parser("list", help="list providers")
+    pv_use = pv_sub.add_parser("use", help="set the active provider")
+    pv_use.add_argument("name")
+    pv.set_defaults(func=cmd_provider)
+
     sub.add_parser("install", help="install the clickable desktop app (app menu / Start menu)") \
        .set_defaults(func=cmd_install)
     sub.add_parser("uninstall", help="remove the desktop app launcher") \

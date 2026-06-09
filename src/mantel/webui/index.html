@@ -66,6 +66,11 @@
   .think summary::-webkit-details-marker { display: none; }
   .think[open] summary { border-bottom: 1px solid var(--border); }
   .think .reason { padding: 10px 12px; white-space: pre-wrap; color: var(--text-dim); font-size: 13px; max-height: 300px; overflow-y: auto; }
+  .tools { display: flex; flex-direction: column; gap: 4px; margin: 0 0 10px; }
+  .tool { font-size: 12.5px; color: var(--text-dim); background: var(--bg-elev); border: 1px solid var(--border); border-radius: 7px; padding: 4px 9px; }
+  .tool code { color: var(--accent); background: none; font-size: 12px; }
+  .tool .ok { color: var(--ok); } .tool .no { color: var(--err); }
+  .tool.note { font-style: italic; }
   .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
   #empty { max-width: var(--maxw); margin: 16vh auto 0; text-align: center; color: var(--text-dim); padding: 0 16px; }
@@ -166,6 +171,23 @@ function addBubble(role){
 }
 function setContent(wrap, text, isMd, cursor){ const el = wrap.querySelector(".content"); el.innerHTML = isMd ? renderMarkdown(text) : escapeHtml(text); el.classList.toggle("cursor", !!cursor); }
 function setReasoning(wrap, text){ const det = wrap.querySelector(".think"); if (!text) { det.style.display = "none"; return; } det.style.display = ""; det.querySelector(".reason").textContent = text; }
+function renderTool(wrap, ev){
+  const bubble = wrap.querySelector(".bubble");
+  let tools = bubble.querySelector(".tools");
+  if (!tools) { tools = document.createElement("div"); tools.className = "tools"; bubble.insertBefore(tools, bubble.querySelector(".content")); }
+  if (ev.phase === "call") {
+    const row = document.createElement("div"); row.className = "tool"; row.dataset.tid = ev.id || "";
+    row.innerHTML = `🔧 <code>${escapeHtml(ev.name || "")}</code><span class="tr"> · running…</span>`;
+    tools.appendChild(row);
+  } else if (ev.phase === "result") {
+    const row = [...tools.querySelectorAll(".tool[data-tid]")].reverse().find(r => r.dataset.tid === (ev.id || "")) || tools.lastElementChild;
+    const icon = ev.denied ? "⛔" : (ev.ok ? "✓" : "✗");
+    const snip = String(ev.content || "").replace(/\s+/g, " ").slice(0, 140);
+    if (row && row.querySelector(".tr")) row.querySelector(".tr").innerHTML = ` <span class="${ev.ok ? "ok" : "no"}">${icon}</span> ${escapeHtml(snip)}`;
+  } else if (ev.phase === "note") {
+    const row = document.createElement("div"); row.className = "tool note"; row.textContent = ev.content || ""; tools.appendChild(row);
+  }
+}
 function scrollDown(){ const m = document.querySelector("main"); m.scrollTop = m.scrollHeight; }
 document.addEventListener("click", (e) => {
   if (e.target.classList.contains("copy")) {
@@ -234,6 +256,7 @@ async function send(){
         if (payload === "[DONE]") return true;
         let obj; try { obj = JSON.parse(payload); } catch { return false; }
         if (obj.error) { err = (obj.error && obj.error.message) || String(obj.error); return true; }
+        if (obj.mantel_tool) { renderTool(wrap, obj.mantel_tool); scrollDown(); return false; }
         const d = (obj.choices && obj.choices[0] && obj.choices[0].delta) || {};
         const reason = d.reasoning || d.reasoning_content || "";
         if (reason && !gotContent) { reasoning += reason; schedule(); }

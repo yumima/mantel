@@ -9,8 +9,10 @@ databases, your own services — with **you** deciding which tools, regardless o
 which model you run. Your data and tools stay local unless you explicitly opt
 into a cloud backend or a remote server.
 
-> **Status: early (M0)** — a working chat window against a local hearth backend.
-> The MCP host, multi-provider support, and profiles are on the roadmap below.
+> **Status: M2** — a working desktop chat client that **hosts MCP servers**: the
+> model can use *your* tools (deny-by-default), across any OpenAI-compatible
+> backend, with a hearth-style management CLI. Multi-vendor adapters, profiles,
+> and interactive approval are on the roadmap below.
 
 ## Why (vs. ChatGPT / Claude desktop)
 - **No vendor lock-in.** One UI, any model — a free local model for most work, a
@@ -40,6 +42,13 @@ then your default browser.
 | Command | What it does |
 |---|---|
 | `mantel` | open the desktop chat window (starts mantel's local server) |
+| `mantel setup` | first-run wizard — find a backend, pick a model, seed MCP examples |
+| `mantel status` | backend reachability, model, MCP servers + tool counts |
+| `mantel doctor` | diagnose the environment (backend, MCP runtimes, window) |
+| `mantel models` | list models from the active backend |
+| `mantel config [show\|path\|edit]` | show / locate / edit the config file |
+| `mantel mcp list\|tools\|enable <n>\|disable <n>` | manage MCP servers |
+| `mantel provider list\|use <n>` | manage backends |
 | `mantel serve` | run the local server in the foreground (headless / dev) |
 | `mantel install` / `uninstall` | add / remove the clickable desktop launcher |
 
@@ -53,8 +62,38 @@ fine). That proxy is exactly where the **MCP host + tool-call loop** land (M2).
 ```
 window (pywebview)  →  mantel server (FastAPI)  →  backend (hearth / OpenAI / …)
    UI at  /               /api/chat  /api/models      /v1/chat/completions
-                          + MCP host (M2) ───────────→ MCP servers (your tools)
+                          + MCP host + agent loop ───→ MCP servers (your tools)
 ```
+
+## Tools (MCP)
+Mantel is an **MCP host**: the enabled servers' tools are offered to the model,
+and mantel runs the **tool-calling loop** for you — executing calls, feeding
+results back, looping until the model answers. Tool activity streams live into
+the chat.
+
+Execution is **deny-by-default**: a tool runs only if its name matches one of
+its server's `auto_approve` globs — anything else is refused, so an autonomous
+model can't touch files / shells / networks you didn't allow.
+
+```bash
+mantel setup                  # seeds safe, *disabled* example servers (needs npx)
+mantel mcp list               # see configured servers
+mantel mcp enable filesystem  # turn one on
+mantel mcp tools              # what tools are now available
+mantel                        # (re)open the window to pick up the change
+```
+
+Add your own with `mantel config edit`:
+```yaml
+mcp_servers:
+  filesystem:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "~/projects"]
+    enabled: true
+    auto_approve: ["read_*", "list_*"]   # reads auto-run; writes are refused
+```
+Any standard MCP **stdio** server works — `npx @modelcontextprotocol/server-*`,
+`uvx mcp-server-*`, or one of your own.
 
 ## Config
 `~/.config/mantel/config.yaml` (optional — absent ⇒ local hearth defaults):
@@ -68,11 +107,11 @@ providers:
 ```
 
 ## Roadmap
-- **M0 — scaffold + chat-to-hearth** ✅ *(this)*
-- **M1 — multi-backend** — provider registry + key storage; OpenAI / Anthropic / Gemini; model picker.
-- **M2 — MCP host** — spawn stdio/SSE servers, aggregate tools, the agent tool-loop, an approval UX; default servers (filesystem / memory / time / git / fetch).
-- **M3 — profiles + settings UI** — profile switcher, server catalog, keys & scopes.
-- **M4 — connectors + packs** — credentialed servers (search / github / …), remote servers, domain packs.
+- **M0 — scaffold + chat-to-hearth** ✅
+- **M2 — MCP host + agent loop** ✅ — stdio servers, tool aggregation, the tool-calling loop, deny-by-default execution, live tool activity, a hearth-style management CLI (`setup` / `status` / `doctor` / `mcp` / `provider` / …).
+- **M1 — multi-vendor backends** — Anthropic / Gemini adapters + key storage (any *OpenAI-compatible* backend already works via config).
+- **M3 — profiles + settings UI** — profile switcher (backend + model + servers + prompt), server catalog, **interactive** tool approval.
+- **M4 — connectors + packs** — credentialed servers (search / github / …), remote (SSE/HTTP) servers, domain packs.
 - **M5 — distribution** — standalone bundles + GitHub releases.
 
 ## Develop

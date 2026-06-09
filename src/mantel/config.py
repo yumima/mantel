@@ -40,6 +40,9 @@ class Config:
     provider: str = "hearth"      # the active provider key
     model: str = "primary_chat"   # hearth role alias by default
     providers: dict[str, Provider] = field(default_factory=lambda: {"hearth": Provider()})
+    # name -> mcp_host.ServerConfig (kept as Any to avoid importing the MCP SDK
+    # at config-import time; empty by default → mantel behaves as a plain chat).
+    mcp_servers: dict = field(default_factory=dict)
 
     def active(self) -> Provider:
         return self.providers.get(self.provider, Provider())
@@ -79,4 +82,44 @@ def load() -> Config:
                 api_key=v.get("api_key", ""),
             )
     cfg.providers.setdefault(cfg.provider, Provider())  # active must resolve
+
+    mcps = data.get("mcp_servers") or {}
+    if isinstance(mcps, dict) and mcps:
+        from .mcp_host import ServerConfig  # lazy — only import the MCP SDK if configured
+        out: dict = {}
+        for name, v in mcps.items():
+            v = v or {}
+            out[name] = ServerConfig(
+                command=v.get("command", ""),
+                args=list(v.get("args") or []),
+                env=dict(v.get("env") or {}),
+                enabled=bool(v.get("enabled", False)),
+                auto_approve=list(v.get("auto_approve") or []),
+            )
+        cfg.mcp_servers = out
     return cfg
+
+
+def save(cfg: Config) -> Path:
+    """Write ``cfg`` back to ~/.config/mantel/config.yaml; returns the path."""
+    p = config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    data: dict = {
+        "host": cfg.host,
+        "port": cfg.port,
+        "provider": cfg.provider,
+        "model": cfg.model,
+        "providers": {
+            n: {"type": pr.type, "base_url": pr.base_url,
+                **({"api_key": pr.api_key} if pr.api_key else {})}
+            for n, pr in cfg.providers.items()
+        },
+    }
+    if cfg.mcp_servers:
+        data["mcp_servers"] = {
+            n: {"command": s.command, "args": s.args, "env": s.env,
+                "enabled": s.enabled, "auto_approve": s.auto_approve}
+            for n, s in cfg.mcp_servers.items()
+        }
+    p.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return p
