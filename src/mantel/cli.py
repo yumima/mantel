@@ -178,7 +178,8 @@ def _live_or_transient_tools(cfg: cfgmod.Config) -> tuple[list[dict], dict]:
 
 
 def _example_mcp_servers() -> dict:
-    """A couple of safe, **disabled** examples to seed the config (Node/npx)."""
+    """Safe, **disabled** servers to seed the config: two Node/npx examples plus
+    mantel's built-in RAG server (local embeddings-backed search over your files)."""
     from .mcp_host import ServerConfig
     home = str(Path.home())
     return {
@@ -187,6 +188,11 @@ def _example_mcp_servers() -> dict:
             enabled=False, auto_approve=["read_*", "list_*", "directory_*", "search_*"]),
         "memory": ServerConfig(
             command="npx", args=["-y", "@modelcontextprotocol/server-memory"],
+            enabled=False, auto_approve=["*"]),
+        # Built-in: RAG over the user's files via the backend's embeddings.
+        # sys.executable is the venv python running mantel → `import mantel` works.
+        "rag": ServerConfig(
+            command=sys.executable, args=["-m", "mantel.mcp_servers.rag"],
             enabled=False, auto_approve=["*"]),
     }
 
