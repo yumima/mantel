@@ -194,6 +194,10 @@ def _example_mcp_servers() -> dict:
         "rag": ServerConfig(
             command=sys.executable, args=["-m", "mantel.mcp_servers.rag"],
             enabled=False, auto_approve=["*"]),
+        # Built-in: fetch a web page/API by URL (readable text).
+        "web": ServerConfig(
+            command=sys.executable, args=["-m", "mantel.mcp_servers.web"],
+            enabled=False, auto_approve=["*"]),
     }
 
 
