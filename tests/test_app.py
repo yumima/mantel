@@ -63,3 +63,46 @@ def test_chat_streams_an_error_frame_when_backend_down():
         assert r.headers["content-type"].startswith("text/event-stream")
         body = b"".join(r.iter_bytes())
     assert b"error" in body and b"unreachable" in body  # surfaced, not swallowed
+
+
+def test_chat_persistence_crud(tmp_path, monkeypatch):
+    """Conversations save, list, reload (multimodal content intact), and delete —
+    against an isolated data dir so the real chats.db is never touched."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    c = _client()
+
+    msgs = [
+        {"role": "user", "content": "hello there"},
+        {"role": "assistant", "content": "Hi! How can I help?"},
+        {"role": "user", "content": [
+            {"type": "text", "text": "what's this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]},
+    ]
+    assert c.put("/api/chats/conv-1", json={"title": "hello there", "messages": msgs}).status_code == 200
+
+    listed = c.get("/api/chats").json()["chats"]
+    assert len(listed) == 1 and listed[0]["id"] == "conv-1" and listed[0]["messages"] == 3
+
+    got = c.get("/api/chats/conv-1").json()
+    assert got["title"] == "hello there" and len(got["messages"]) == 3
+    # multimodal content round-trips as a list, not a stringified blob
+    assert isinstance(got["messages"][2]["content"], list)
+    assert got["messages"][2]["content"][1]["type"] == "image_url"
+
+    # PUT replaces (upsert), doesn't append
+    c.put("/api/chats/conv-1", json={"title": "renamed", "messages": msgs[:1]})
+    got2 = c.get("/api/chats/conv-1").json()
+    assert got2["title"] == "renamed" and len(got2["messages"]) == 1
+
+    assert c.delete("/api/chats/conv-1").json()["ok"] is True
+    assert c.get("/api/chats").json()["chats"] == []
+    assert c.get("/api/chats/conv-1").status_code == 404
+
+
+def test_chat_persistence_tolerates_malformed_messages(tmp_path, monkeypatch):
+    """A malformed messages payload must not 500 (non-dict items are dropped)."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    c = _client()
+    r = c.put("/api/chats/bad", json={"title": "x", "messages": ["not-a-dict", {"role": "user", "content": "ok"}]})
+    assert r.status_code == 200
+    assert len(c.get("/api/chats/bad").json()["messages"]) == 1

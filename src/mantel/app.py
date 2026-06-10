@@ -17,8 +17,12 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
+import sqlite3
+import time
 from contextlib import asynccontextmanager
 from importlib import resources
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -130,6 +134,21 @@ def _extract_text(name: str, data: bytes) -> str:
             return data.decode("latin-1", "replace")
     raise _ExtractError(
         f"unsupported document type '{ext}' — attach an image, PDF, DOCX, or text file")
+
+
+def _chats_db() -> sqlite3.Connection:
+    """SQLite store for persisted conversations (~/.local/share/mantel/chats.db)."""
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    d = Path(base) / "mantel"
+    d.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(d / "chats.db", timeout=10.0)
+    con.execute("PRAGMA busy_timeout=5000")
+    con.execute("CREATE TABLE IF NOT EXISTS conversations("
+                "id TEXT PRIMARY KEY, title TEXT, created REAL, updated REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS messages("
+                "conv_id TEXT, seq INTEGER, role TEXT, content TEXT)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id)")
+    return con
 
 
 def _has_image(messages: list) -> bool:
@@ -289,6 +308,77 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
             return JSONResponse(r.json(), status_code=r.status_code)
         except (httpx.HTTPError, ValueError) as e:
             return JSONResponse({"error": str(e), "data": []}, status_code=502)
+
+    # ── conversation persistence ─────────────────────────────────────────────
+    @app.get("/api/chats")
+    async def list_chats() -> JSONResponse:
+        con = _chats_db()
+        try:
+            rows = con.execute(
+                "SELECT c.id, c.title, c.updated, "
+                "(SELECT count(*) FROM messages m WHERE m.conv_id = c.id) "
+                "FROM conversations c ORDER BY c.updated DESC").fetchall()
+        finally:
+            con.close()
+        return JSONResponse({"chats": [
+            {"id": r[0], "title": r[1], "updated": r[2], "messages": r[3]} for r in rows]})
+
+    @app.get("/api/chats/{cid}")
+    async def get_chat(cid: str) -> JSONResponse:
+        con = _chats_db()
+        try:
+            c = con.execute("SELECT id, title FROM conversations WHERE id=?", (cid,)).fetchone()
+            if not c:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            msgs = con.execute(
+                "SELECT role, content FROM messages WHERE conv_id=? ORDER BY seq", (cid,)).fetchall()
+        finally:
+            con.close()
+        out = []
+        for role, content in msgs:
+            try:
+                content = json.loads(content)
+            except (ValueError, TypeError):
+                pass
+            out.append({"role": role, "content": content})
+        return JSONResponse({"id": c[0], "title": c[1], "messages": out})
+
+    @app.put("/api/chats/{cid}")
+    async def put_chat(cid: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        title = (body.get("title") or "Untitled")[:120]
+        messages = body.get("messages") or []
+        now = time.time()
+        con = _chats_db()
+        try:
+            exists = con.execute("SELECT 1 FROM conversations WHERE id=?", (cid,)).fetchone()
+            if exists:
+                con.execute("UPDATE conversations SET title=?, updated=? WHERE id=?", (title, now, cid))
+            else:
+                con.execute("INSERT INTO conversations(id,title,created,updated) VALUES(?,?,?,?)",
+                            (cid, title, now, now))
+            con.execute("DELETE FROM messages WHERE conv_id=?", (cid,))
+            if not isinstance(messages, list):
+                messages = []
+            con.executemany(
+                "INSERT INTO messages(conv_id,seq,role,content) VALUES(?,?,?,?)",
+                [(cid, i, m.get("role", ""), json.dumps(m.get("content")))
+                 for i, m in enumerate(messages) if isinstance(m, dict)])
+            con.commit()
+        finally:
+            con.close()
+        return JSONResponse({"ok": True, "id": cid, "title": title})
+
+    @app.delete("/api/chats/{cid}")
+    async def delete_chat(cid: str) -> JSONResponse:
+        con = _chats_db()
+        try:
+            con.execute("DELETE FROM conversations WHERE id=?", (cid,))
+            con.execute("DELETE FROM messages WHERE conv_id=?", (cid,))
+            con.commit()
+        finally:
+            con.close()
+        return JSONResponse({"ok": True})
 
     @app.post("/api/extract")
     async def api_extract(file: UploadFile = File(...)) -> JSONResponse:
