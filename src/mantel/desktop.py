@@ -22,13 +22,18 @@ from pathlib import Path
 
 # ── the window ────────────────────────────────────────────────────────────────
 
+# Default app-window size, shared by the native webview and the --app fallback.
+# Sized for a chat UI: comfortably under a laptop screen and roughly half of a
+# typical desktop, instead of Chromium's oversized default for app windows.
+_WIN_W, _WIN_H = 1100, 850
+
 
 def open_window(url: str) -> int:
     # 1) pywebview — a real chrome-less native window using the OS webview.
     try:
         import webview  # type: ignore
 
-        webview.create_window("Mantel", url, width=1040, height=780, min_size=(420, 480))
+        webview.create_window("Mantel", url, width=_WIN_W, height=_WIN_H, min_size=(420, 480))
         icon = _window_icon()
         try:
             webview.start(icon=icon) if icon else webview.start()
@@ -50,8 +55,24 @@ def open_window(url: str) -> int:
         try:
             profile = str(_user_data_dir() / "chrome-profile")
             print(f"Mantel — app window via {Path(browser[0]).name}; close it to quit.")
-            proc = subprocess.Popen([*browser, f"--app={url}", f"--user-data-dir={profile}",
-                                     "--no-first-run", "--no-default-browser-check"])
+            cmd = [*browser, f"--app={url}", f"--user-data-dir={profile}",
+                   "--no-first-run", "--no-default-browser-check",
+                   f"--window-size={_WIN_W},{_WIN_H}"]
+            # Linux/GNOME dock integration. A Chromium --app window on *Wayland*
+            # invents its own app_id ("chrome-<url>-<profile>"), so the running
+            # window never matches our launcher (mantel.desktop / StartupWMClass=
+            # mantel): no "running" dot, dock clicks relaunch instead of focusing,
+            # and the right-click menu shows no window list. --class sets the X11
+            # WM_CLASS — which GNOME *does* match to StartupWMClass — but Chromium
+            # only honours it under X11/XWayland, not native Wayland. So on Linux
+            # we pin the class to "mantel" and route the window through XWayland
+            # (when present), making the dock treat it as a first-class app the way
+            # Claude's desktop client behaves.
+            if sys.platform.startswith("linux"):
+                cmd.append("--class=mantel")
+                if os.environ.get("DISPLAY"):  # XWayland (or X11) available
+                    cmd.append("--ozone-platform=x11")
+            proc = subprocess.Popen(cmd)
             proc.wait()
             return 0
         except OSError:

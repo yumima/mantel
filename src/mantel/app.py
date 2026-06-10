@@ -15,13 +15,14 @@ configured the loop runs once → it's a plain streaming chat.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from contextlib import asynccontextmanager
 from importlib import resources
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -81,6 +82,65 @@ def _build_host(cfg: cfgmod.Config):
         return None
     from .mcp_host import MCPHost
     return MCPHost(cfg.mcp_servers)
+
+
+# ── attachments: server-side document → text extraction ───────────────────────
+# Images are handled in the browser (read as base64 and sent inline as image_url
+# parts straight to the vision model); this covers PDFs, DOCX, and text-ish files
+# the browser can't parse itself.
+
+_MAX_DOC_BYTES = 25 * 1024 * 1024   # reject uploads larger than this
+_MAX_DOC_CHARS = 200_000            # cap injected text so the prompt stays sane
+_TEXT_EXTS = {
+    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml", ".log",
+    ".py", ".js", ".ts", ".tsx", ".html", ".css", ".scss", ".sh", ".c", ".cpp",
+    ".h", ".hpp", ".rs", ".go", ".java", ".rb", ".php", ".toml", ".ini", ".cfg",
+    ".xml", ".sql", ".r", ".lua", ".pl", ".kt", ".swift",
+}
+
+
+class _ExtractError(Exception):
+    pass
+
+
+def _extract_text(name: str, data: bytes) -> str:
+    """Best-effort text extraction from an uploaded document (PDF / DOCX / text)."""
+    from pathlib import PurePosixPath
+
+    ext = PurePosixPath(name).suffix.lower()
+    if ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError as e:
+            raise _ExtractError("PDF support needs the 'pypdf' package") from e
+        reader = PdfReader(io.BytesIO(data))
+        return "\n\n".join((page.extract_text() or "") for page in reader.pages)
+    if ext == ".docx":
+        try:
+            import docx  # python-docx
+        except ImportError as e:
+            raise _ExtractError("DOCX support needs the 'python-docx' package") from e
+        document = docx.Document(io.BytesIO(data))
+        return "\n".join(p.text for p in document.paragraphs)
+    if ext in _TEXT_EXTS or not ext:
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data.decode("latin-1", "replace")
+    raise _ExtractError(
+        f"unsupported document type '{ext}' — attach an image, PDF, DOCX, or text file")
+
+
+def _has_image(messages: list) -> bool:
+    """True if any message carries an image content part — those requests must go
+    to a vision-capable model (a text model can't read images in the history)."""
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list) and any(
+            isinstance(p, dict) and p.get("type") == "image_url" for p in content
+        ):
+            return True
+    return False
 
 
 def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
@@ -229,6 +289,26 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
         except (httpx.HTTPError, ValueError) as e:
             return JSONResponse({"error": str(e), "data": []}, status_code=502)
 
+    @app.post("/api/extract")
+    async def api_extract(file: UploadFile = File(...)) -> JSONResponse:
+        """Extract text from an uploaded document (PDF / DOCX / text) so the UI can
+        include it in a chat message. Images are NOT sent here — the browser inlines
+        them as image_url parts straight to the (vision) model."""
+        # Read at most the cap (+1 to detect overflow) so a giant upload can't
+        # balloon memory (Starlette has already spooled the body to a temp file).
+        data = await file.read(_MAX_DOC_BYTES + 1)
+        if len(data) > _MAX_DOC_BYTES:
+            return JSONResponse({"error": "file too large (max 25 MB)"}, status_code=413)
+        try:
+            text = _extract_text(file.filename or "file", data)
+        except _ExtractError as e:
+            return JSONResponse({"error": str(e)}, status_code=415)
+        except Exception as e:  # never 500 on a malformed upload
+            return JSONResponse({"error": f"could not read document: {e}"}, status_code=422)
+        truncated = len(text) > _MAX_DOC_CHARS
+        return JSONResponse({"name": file.filename, "chars": min(len(text), _MAX_DOC_CHARS),
+                             "truncated": truncated, "text": text[:_MAX_DOC_CHARS]})
+
     @app.post("/api/chat")
     async def api_chat(request: Request) -> StreamingResponse:
         body = await request.json()
@@ -236,6 +316,18 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
         host = app.state.host
         messages = list(body.get("messages") or [])
         base = {k: v for k, v in body.items() if k not in ("messages", "stream")}
+        # An image anywhere in the conversation forces a vision-capable model — a
+        # text-only chat model can't read image_url parts. Route to the configured
+        # vision model (hearth's `vision` role by default). Only for LOCAL providers
+        # (no api_key): a cloud provider has no "vision" role, and its selected model
+        # (e.g. gpt-4o) already handles images, so leave that request untouched.
+        vmodel = app.state.cfg.vision_model
+        if vmodel and not prov.api_key and _has_image(messages):
+            base = {**base, "model": vmodel}
+            # Force the OpenAI passthrough (which carries image_url parts) — a
+            # `think` flag would route hearth to its native path, which doesn't
+            # translate images. Vision doesn't need the deep-think toggle anyway.
+            base.pop("think", None)
         tools = host.openai_tools() if (host and host.has_tools()) else None
 
         async def gen():
