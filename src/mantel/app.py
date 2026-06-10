@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, File, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import config as cfgmod
@@ -90,6 +90,7 @@ def _build_host(cfg: cfgmod.Config):
 # the browser can't parse itself.
 
 _MAX_DOC_BYTES = 25 * 1024 * 1024   # reject uploads larger than this
+_MAX_AUDIO_BYTES = 25 * 1024 * 1024  # reject mic recordings larger than this
 _MAX_DOC_CHARS = 200_000            # cap injected text so the prompt stays sane
 _TEXT_EXTS = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml", ".log",
@@ -308,6 +309,53 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
         truncated = len(text) > _MAX_DOC_CHARS
         return JSONResponse({"name": file.filename, "chars": min(len(text), _MAX_DOC_CHARS),
                              "truncated": truncated, "text": text[:_MAX_DOC_CHARS]})
+
+    @app.post("/api/transcribe")
+    async def api_transcribe(file: UploadFile = File(...)) -> JSONResponse:
+        """Speech-to-text: proxy recorded audio to the backend's OpenAI-style
+        /audio/transcriptions (hearth's faster-whisper route) and return the text."""
+        data = await file.read(_MAX_AUDIO_BYTES + 1)
+        if len(data) > _MAX_AUDIO_BYTES:
+            return JSONResponse({"error": "audio too large (max 25 MB)"}, status_code=413)
+        prov = app.state.cfg.active()
+        files = {"file": (file.filename or "speech.webm", data, file.content_type or "audio/webm")}
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                r = await client.post(f"{prov.base_url}/audio/transcriptions",
+                                      files=files, data={"model": "whisper-1"},
+                                      headers=prov.headers())
+        except httpx.HTTPError as e:
+            return JSONResponse({"error": f"STT backend unreachable: {e}"}, status_code=502)
+        if r.status_code != 200:
+            return JSONResponse({"error": r.text[:300] or "transcription failed"},
+                                status_code=r.status_code)
+        try:
+            return JSONResponse({"text": (r.json() or {}).get("text", "")})
+        except ValueError:
+            return JSONResponse({"text": r.text})
+
+    @app.post("/api/speak")
+    async def api_speak(request: Request):
+        """Text-to-speech: proxy to the backend's OpenAI-style /audio/speech
+        (hearth's Piper route, or a cloud TTS) and return the audio bytes."""
+        body = await request.json()
+        text = (body.get("text") or "").strip()
+        if not text:
+            return JSONResponse({"error": "missing 'text'"}, status_code=400)
+        prov = app.state.cfg.active()
+        req = {"model": "tts-1", "input": text[:4000]}  # model ignored by hearth; valid for OpenAI
+        voice = body.get("voice") or app.state.cfg.tts_voice
+        if voice:
+            req["voice"] = voice
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                r = await client.post(f"{prov.base_url}/audio/speech", json=req, headers=prov.headers())
+        except httpx.HTTPError as e:
+            return JSONResponse({"error": f"TTS backend unreachable: {e}"}, status_code=502)
+        if r.status_code != 200:
+            return JSONResponse({"error": r.text[:300] or "TTS failed"}, status_code=r.status_code)
+        return Response(content=r.content,
+                        media_type=r.headers.get("content-type", "audio/wav"))
 
     @app.post("/api/chat")
     async def api_chat(request: Request) -> StreamingResponse:

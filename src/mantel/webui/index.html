@@ -100,6 +100,10 @@
   #attach { flex: 0 0 auto; width: 32px; height: 36px; background: transparent; border: 0; cursor: pointer;
     color: var(--text-dim); font-size: 17px; display: grid; place-items: center; padding: 0; }
   #attach:hover { color: var(--accent); }
+  #mic { flex: 0 0 auto; width: 32px; height: 36px; background: transparent; border: 0; cursor: pointer;
+    color: var(--text-dim); font-size: 16px; display: grid; place-items: center; padding: 0; }
+  #mic:hover { color: var(--accent); }
+  #mic.rec { color: var(--err); animation: blink 1s steps(2) infinite; }
   .attachbar { max-width: var(--maxw); margin: 0 auto 8px; display: flex; flex-wrap: wrap; gap: 6px; }
   .attachbar.hidden { display: none; }
   .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg-input);
@@ -112,6 +116,9 @@
   .composer.drag { border-color: var(--accent); outline: 2px dashed var(--accent-dim); outline-offset: 2px; }
   .msg .att { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .msg .att img { max-width: 240px; max-height: 240px; border-radius: 8px; border: 1px solid var(--border); }
+  .msgact { display: flex; gap: 6px; margin-top: 8px; }
+  .msgact .speak { font-size: 12px; padding: 2px 9px; opacity: .55; }
+  .msgact .speak:hover { opacity: 1; }
 </style>
 </head>
 <body>
@@ -137,6 +144,7 @@
       <button id="attach" title="Attach image or document">📎</button>
       <input type="file" id="file" multiple hidden
              accept="image/*,.pdf,.docx,.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.log,.py,.js,.ts,.tsx,.html,.css,.sh,.c,.cpp,.h,.rs,.go,.java,.rb,.toml,.ini,.xml,.sql">
+      <button id="mic" title="Voice input (speak → text)">🎤</button>
       <textarea id="input" rows="1" placeholder="Message…   ( type / for commands )" autofocus></textarea>
       <button id="send" title="Send">↑</button>
     </div>
@@ -475,6 +483,68 @@ function renderUserBubble(wrap, text, atts){
   wrap.querySelector(".bubble").appendChild(box);
 }
 
+// ── read-aloud (TTS via /api/speak → backend Piper/OpenAI) ────────────────────
+let ttsAudio = null;
+function addSpeakBtn(wrap, text){
+  const bubble = wrap.querySelector(".bubble"); if (!bubble || bubble.querySelector(".msgact")) return;
+  const bar = document.createElement("div"); bar.className = "msgact";
+  const b = document.createElement("button"); b.className = "btn speak"; b.textContent = "🔊"; b.title = "Read aloud";
+  b.addEventListener("click", () => speak(b, text));
+  bar.appendChild(b); bubble.appendChild(bar);
+}
+async function speak(btn, text){
+  if (ttsAudio) { const wasThis = ttsAudio._btn === btn; ttsAudio.pause(); ttsAudio = null; if (wasThis) { btn.textContent = "🔊"; return; } }
+  btn.textContent = "…";
+  try {
+    const r = await fetch("/api/speak", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+    if (!r.ok) { let m = "TTS unavailable"; try { m = (await r.json()).error || m; } catch {} btn.textContent = "🔇"; btn.title = m; setTimeout(() => { btn.textContent = "🔊"; btn.title = "Read aloud"; }, 2500); return; }
+    const url = URL.createObjectURL(await r.blob());
+    const a = new Audio(url); a._btn = btn; ttsAudio = a;
+    btn.textContent = "⏹";
+    const done = () => { if (ttsAudio === a) ttsAudio = null; btn.textContent = "🔊"; URL.revokeObjectURL(url); };
+    a.onended = done; a.onerror = done;
+    a.play().catch(done);
+  } catch { btn.textContent = "🔊"; }
+}
+
+// ── voice input (mic → /api/transcribe → composer) ────────────────────────────
+let mediaRec = null, recChunks = [], recStream = null;
+async function toggleMic(){
+  const btn = $("mic");
+  if (mediaRec && mediaRec.state === "recording") { mediaRec.stop(); return; }
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+    sysMsg("⚠ microphone/recording not available in this browser"); return;
+  }
+  try { recStream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { sysMsg(`⚠ mic permission denied: ${escapeHtml(String(e.message || e))}`); return; }
+  recChunks = [];
+  try { mediaRec = new MediaRecorder(recStream); }
+  catch (e) {
+    recStream.getTracks().forEach(t => t.stop()); recStream = null;   // don't leave the mic live
+    sysMsg(`⚠ recording unsupported here: ${escapeHtml(String(e.message || e))}`); return;
+  }
+  mediaRec.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
+  mediaRec.onstop = async () => {
+    recStream.getTracks().forEach(t => t.stop()); recStream = null;
+    btn.classList.remove("rec"); btn.textContent = "🎤"; btn.title = "Voice input (speak → text)";
+    const blob = new Blob(recChunks, { type: (mediaRec && mediaRec.mimeType) || "audio/webm" });
+    if (!blob.size) return;
+    btn.textContent = "…";
+    try {
+      const fd = new FormData(); fd.append("file", blob, "speech.webm");
+      const r = await fetch("/api/transcribe", { method: "POST", body: fd });
+      const j = await r.json().catch(() => ({}));
+      btn.textContent = "🎤";
+      if (!r.ok) { sysMsg(`⚠ ${escapeHtml(j.error || "transcription failed")}`); return; }
+      const t = (j.text || "").trim();
+      if (t) { const inp = $("input"); inp.value = (inp.value ? inp.value.trim() + " " : "") + t; autogrow(); inp.focus(); }
+    } catch (e) { btn.textContent = "🎤"; sysMsg(`⚠ ${escapeHtml(String(e.message || e))}`); }
+  };
+  mediaRec.start();
+  btn.classList.add("rec"); btn.textContent = "⏺"; btn.title = "Stop & transcribe";
+}
+$("mic").addEventListener("click", toggleMic);
+
 async function send(){
   if (streaming) { controller?.abort(); return; }
   hidePalette();
@@ -554,7 +624,7 @@ async function send(){
     setSending(false); controller = null; return;
   }
   setContent(wrap, answer, true, false);
-  if (answer) history.push({ role: "assistant", content: answer });
+  if (answer) { history.push({ role: "assistant", content: answer }); addSpeakBtn(wrap, answer); }
   else { history.pop(); wrap.remove(); }
   setSending(false); controller = null; $("input").focus();
 }

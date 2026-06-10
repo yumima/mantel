@@ -41,6 +41,8 @@ class Config:
     model: str = "primary_chat"   # hearth role alias by default
     vision_model: str = "vision"  # model/role used when a message carries an image
                                   # (hearth's `vision` role); "" disables routing
+    tts_voice: str = ""           # voice id for read-aloud (e.g. "en_US-amy-medium");
+                                  # "" lets the backend pick its default voice
     providers: dict[str, Provider] = field(default_factory=lambda: {"hearth": Provider()})
     # name -> mcp_host.ServerConfig (kept as Any to avoid importing the MCP SDK
     # at config-import time; empty by default → mantel behaves as a plain chat).
@@ -74,6 +76,7 @@ def load() -> Config:
     cfg.provider = data.get("provider", cfg.provider)
     cfg.model = data.get("model", cfg.model)
     cfg.vision_model = data.get("vision_model", cfg.vision_model)
+    cfg.tts_voice = data.get("tts_voice", cfg.tts_voice)
     provs = data.get("providers") or {}
     if isinstance(provs, dict) and provs:
         cfg.providers = {}
@@ -113,6 +116,7 @@ def save(cfg: Config) -> Path:
         "provider": cfg.provider,
         "model": cfg.model,
         "vision_model": cfg.vision_model,
+        "tts_voice": cfg.tts_voice,
         "providers": {
             n: {"type": pr.type, "base_url": pr.base_url,
                 **({"api_key": pr.api_key} if pr.api_key else {})}
