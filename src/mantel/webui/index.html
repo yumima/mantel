@@ -198,6 +198,7 @@
   <aside id="cfgPanel" class="drawer hidden" aria-label="Tools and settings">
     <div class="drawerHead"><span>⚙ Tools &amp; Settings</span><button class="btn" id="cfgClose" title="Close">✕</button></div>
     <div class="drawerBody">
+      <section><h4>Language tutor</h4><div id="cfgTeachers"></div><div class="cfgempty">Pick a language, then click 🎙️ for a spoken lesson (or just type). The tutor speaks &amp; understands that language.</div></section>
       <section><h4>Backend</h4><div id="cfgProviders"></div><div id="cfgStatus" class="cfgempty"></div></section>
       <section><h4>MCP servers</h4><div id="cfgServers"></div></section>
       <section><h4>Tools <span id="cfgToolCount" class="muted"></span></h4><div id="cfgTools"></div></section>
@@ -213,6 +214,15 @@ let controller = null;
 let streaming = false;
 let attachments = [];   // pending: {kind:"image", url, name} | {kind:"doc", name, text, chars}
 let currentConvId = null;   // id of the conversation being persisted (null = unsaved/new)
+let currentTeacher = null;  // active language-tutor persona (null = normal chat)
+// Language tutors: code = whisper language hint, voice = piper voice id, prompt = persona.
+const TEACHERS = [
+  { code: "it", name: "Italian",  voice: "it_IT-riccardo-x_low",   prompt: "You are Marco, a warm, patient Italian conversation tutor. Speak mostly in simple, natural Italian matched to a beginner–intermediate learner; keep sentences short. When the learner makes a mistake, gently restate it correctly, then continue with a follow-up question. Add a brief English hint in (parentheses) only for hard words. Keep replies to 1–3 sentences so it stays a real back-and-forth conversation." },
+  { code: "fr", name: "French",   voice: "fr_FR-siwis-medium",     prompt: "You are Camille, a warm, patient French conversation tutor. Speak mostly in simple, natural French matched to the learner; short sentences. Gently restate mistakes correctly, then ask a follow-up. Brief English hints in (parentheses) for hard words only. Keep replies to 1–3 sentences." },
+  { code: "es", name: "Spanish",  voice: "es_ES-davefx-medium",    prompt: "You are Lucía, a warm, patient Spanish conversation tutor. Speak mostly in simple, natural Spanish matched to the learner; short sentences. Gently restate mistakes correctly, then ask a follow-up. Brief English hints in (parentheses) for hard words only. Keep replies to 1–3 sentences." },
+  { code: "de", name: "German",   voice: "de_DE-thorsten-medium",  prompt: "You are Lukas, a warm, patient German conversation tutor. Speak mostly in simple, natural German matched to the learner; short sentences. Gently restate mistakes correctly, then ask a follow-up. Brief English hints in (parentheses) for hard words only. Keep replies to 1–3 sentences." },
+  { code: "zh", name: "Mandarin", voice: "zh_CN-huayan-medium",    prompt: "You are 小梅 (Xiǎo Méi), a warm, patient Mandarin Chinese conversation tutor. Speak mostly in simple Mandarin matched to the learner; short sentences. Write Chinese characters followed by pinyin in (parentheses) plus a brief English gloss for hard words. Gently restate mistakes correctly, then ask a follow-up. Keep replies to 1–3 sentences." },
+];
 
 // ── tiny Markdown renderer (no deps) ───────────────────────────────────────
 function escapeHtml(s){ return s.replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
@@ -559,7 +569,8 @@ async function speak(btn, text){
   if (ttsAudio) { const wasThis = ttsAudio._btn === btn; ttsAudio.pause(); ttsAudio = null; if (wasThis) { btn.textContent = "🔊"; return; } }
   btn.textContent = "…";
   try {
-    const r = await fetch("/api/speak", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+    const v = currentTeacher?.voice;
+    const r = await fetch("/api/speak", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(v ? { text, voice: v } : { text }) });
     if (!r.ok) { let m = "TTS unavailable"; try { m = (await r.json()).error || m; } catch {} btn.textContent = "🔇"; btn.title = m; setTimeout(() => { btn.textContent = "🔊"; btn.title = "Read aloud"; }, 2500); return; }
     const url = URL.createObjectURL(await r.blob());
     const a = new Audio(url); a._btn = btn; ttsAudio = a;
@@ -705,9 +716,12 @@ async function streamTurn(userContent, displayText, atts){
   const wrap = addBubble("assistant");
   let answer = "", reasoning = "", gotContent = false, err = null;
   setContent(wrap, "", false, true); scrollDown();
+  // Inject the active tutor persona as a system message (per-request, not stored
+  // in history, so it always leads and can be switched freely).
+  const msgs = currentTeacher ? [{ role: "system", content: currentTeacher.prompt }, ...history] : history;
   // Deep-think off → hearth's `think:false` fast lane (a no-op on non-hearth backends).
-  const req = deepThink ? { model, messages: history, stream: true }
-                        : { model, messages: history, stream: true, think: false };
+  const req = deepThink ? { model, messages: msgs, stream: true }
+                        : { model, messages: msgs, stream: true, think: false };
   setSending(true); controller = new AbortController();
   let raf = 0;
   const paint = () => { raf = 0; setReasoning(wrap, gotContent ? "" : reasoning); setContent(wrap, answer, true, true); if (reasoning && !gotContent) wrap.querySelector(".think").open = true; scrollDown(); };
@@ -765,10 +779,10 @@ function voiceStatus(s){
   const b = $("voicebtn"); if (b) b.title = voiceMode ? ("Voice mode: " + (s || "on") + " — click to stop") : "Hands-free voice mode";
   $("hint").textContent = voiceMode ? `🎙️ ${s || "on"} — click 🎙️ to stop` : "Enter to send · Shift+Enter newline · 📎 attach · 🎙️ voice";
 }
-function speakText(text){
+function speakText(text, voice){
   return new Promise(async (resolve) => {
     try {
-      const r = await fetch("/api/speak", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+      const r = await fetch("/api/speak", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(voice ? { text, voice } : { text }) });
       if (!r.ok) { resolve(); return; }
       const url = URL.createObjectURL(await r.blob());
       const a = new Audio(url); ttsAudio = a;
@@ -813,9 +827,10 @@ function listenWithVAD(maxMs = 15000, silenceMs = 1200){
     rec.start(); raf = requestAnimationFrame(tick);
   });
 }
-async function transcribeBlob(blob){
+async function transcribeBlob(blob, language){
   try {
     const fd = new FormData(); fd.append("file", blob, "speech.webm");
+    if (language) fd.append("language", language);
     const r = await fetch("/api/transcribe", { method: "POST", body: fd });
     const j = await r.json().catch(() => ({}));
     return r.ok ? (j.text || "").trim() : "";
@@ -827,14 +842,14 @@ async function voiceLoop(){
     if (!voiceMode) break;
     if (!blob || blob.size < 1600) continue;            // nothing / too short
     voiceStatus("transcribing…");
-    const text = await transcribeBlob(blob);
+    const text = await transcribeBlob(blob, currentTeacher?.code);
     if (!voiceMode) break;
     if (!text) continue;
     addBubble("system").querySelector(".content").innerHTML = `<span style="color:var(--text-dim)">🎙️ “${escapeHtml(text)}”</span>`; scrollDown();
     voiceStatus("thinking…");
     const answer = await streamTurn(text, text, []);
     if (!voiceMode) break;
-    if (answer && answer.trim()) { voiceStatus("speaking…"); await speakText(answer); }
+    if (answer && answer.trim()) { voiceStatus("speaking…"); await speakText(answer, currentTeacher?.voice); }
   }
   voiceStatus("");
 }
@@ -916,7 +931,29 @@ $("chatsbtn").addEventListener("click", openChats);
 $("chatsScrim").addEventListener("click", closeChats);
 $("chatsNew").addEventListener("click", () => { if (streaming) controller?.abort(); history = []; currentConvId = null; $("thread").innerHTML = ""; setEmpty(true); closeChats(); $("input").focus(); });
 
+function setTeacher(t){
+  currentTeacher = t;
+  if (!$("cfgPanel").classList.contains("hidden")) refreshCfg();
+  if (t) {
+    addBubble("system").querySelector(".content").innerHTML =
+      `<span style="color:var(--text-dim)">🎓 ${escapeHtml(t.name)} tutor active — I'll speak &amp; understand ${escapeHtml(t.name)}. Click 🎙️ for a spoken lesson, or just type.</span>`;
+    scrollDown();
+  }
+}
 async function refreshCfg(){
+  // language tutors (static list)
+  const te = $("cfgTeachers");
+  if (te) {
+    te.innerHTML = "";
+    const off = document.createElement("button");
+    off.className = "pill" + (!currentTeacher ? " on" : ""); off.textContent = "Off";
+    off.addEventListener("click", () => setTeacher(null)); te.appendChild(off);
+    for (const t of TEACHERS) {
+      const b = document.createElement("button");
+      b.className = "pill" + (currentTeacher && currentTeacher.code === t.code ? " on" : "");
+      b.textContent = t.name; b.addEventListener("click", () => setTeacher(t)); te.appendChild(b);
+    }
+  }
   try {
     const c = await (await fetch("/api/config")).json();
     $("cfgStatus").textContent = `${c.backend} · ${c.tools} tool(s)`;

@@ -26,7 +26,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -401,19 +401,22 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
                              "truncated": truncated, "text": text[:_MAX_DOC_CHARS]})
 
     @app.post("/api/transcribe")
-    async def api_transcribe(file: UploadFile = File(...)) -> JSONResponse:
+    async def api_transcribe(file: UploadFile = File(...), language: str = Form("")) -> JSONResponse:
         """Speech-to-text: proxy recorded audio to the backend's OpenAI-style
-        /audio/transcriptions (hearth's faster-whisper route) and return the text."""
+        /audio/transcriptions (hearth's faster-whisper route) and return the text.
+        Optional `language` (e.g. 'it') sharpens accuracy for language practice."""
         data = await file.read(_MAX_AUDIO_BYTES + 1)
         if len(data) > _MAX_AUDIO_BYTES:
             return JSONResponse({"error": "audio too large (max 25 MB)"}, status_code=413)
         prov = app.state.cfg.active()
         files = {"file": (file.filename or "speech.webm", data, file.content_type or "audio/webm")}
+        form = {"model": "whisper-1"}
+        if language.strip():
+            form["language"] = language.strip()
         try:
             async with httpx.AsyncClient(timeout=180.0) as client:
                 r = await client.post(f"{prov.base_url}/audio/transcriptions",
-                                      files=files, data={"model": "whisper-1"},
-                                      headers=prov.headers())
+                                      files=files, data=form, headers=prov.headers())
         except httpx.HTTPError as e:
             return JSONResponse({"error": f"STT backend unreachable: {e}"}, status_code=502)
         if r.status_code != 200:
