@@ -104,7 +104,15 @@
   #voicebtn { flex: 0 0 auto; width: 32px; height: 36px; background: transparent; border: 0; cursor: pointer;
     color: var(--text-dim); font-size: 17px; display: grid; place-items: center; padding: 0; }
   #voicebtn:hover { color: var(--accent); }
-  #voicebtn.on { color: var(--ok); animation: blink 1.4s steps(2) infinite; }
+  #voicebtn.on { color: var(--ok); }
+  #voicebtn.hot { color: var(--err); animation: blink 0.9s steps(2) infinite; }   /* mic is recording */
+  /* activity indicator (listening / transcribing / thinking / speaking) */
+  .activity { max-width: var(--maxw); margin: 0 auto 8px; display: flex; align-items: center; gap: 8px;
+    font-size: 13px; color: var(--text); }
+  .activity.hidden { display: none; }
+  .activity .adot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; background: var(--accent); }
+  .activity.listen .adot { background: var(--err); animation: blink 0.9s steps(2) infinite; }
+  .activity.work .adot { background: var(--accent); animation: blink 1.2s steps(2) infinite; }
   .attachbar { max-width: var(--maxw); margin: 0 auto 8px; display: flex; flex-wrap: wrap; gap: 6px; }
   .attachbar.hidden { display: none; }
   .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg-input);
@@ -173,6 +181,7 @@
     <div id="empty"><div class="big">Mantel</div><div id="emptySub">Universal chat — local-first, any backend.</div></div>
   </main>
   <footer>
+    <div id="activity" class="activity hidden"></div>
     <div id="attachBar" class="attachbar hidden"></div>
     <div class="composer">
       <div id="palette" class="palette hidden"></div>
@@ -704,6 +713,7 @@ async function _streamTurn(userContent, displayText, atts){
   const req = deepThink ? { model, messages: msgs, stream: true }
                         : { model, messages: msgs, stream: true, think: false };
   setSending(true); controller = new AbortController();
+  if (!voiceMode) setActivity("💭 Thinking…", "work");   // visible while the model loads/reasons
   let raf = 0;
   const paint = () => { raf = 0; setReasoning(wrap, gotContent ? "" : reasoning); setContent(wrap, answer, true, true); if (reasoning && !gotContent) wrap.querySelector(".think").open = true; scrollDown(); };
   const schedule = () => { if (!raf) raf = requestAnimationFrame(paint); };
@@ -721,7 +731,7 @@ async function _streamTurn(userContent, displayText, atts){
         const d = (obj.choices && obj.choices[0] && obj.choices[0].delta) || {};
         const reason = d.reasoning || d.reasoning_content || "";
         if (reason && !gotContent) { reasoning += reason; schedule(); }
-        if (d.content) { gotContent = true; answer += d.content; schedule(); }
+        if (d.content) { if (!gotContent && !voiceMode) setActivity("", ""); gotContent = true; answer += d.content; schedule(); }
         return false;
       };
       const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "", stop = false;
@@ -738,13 +748,14 @@ async function _streamTurn(userContent, displayText, atts){
   } catch (e) { if (e.name !== "AbortError") err = String(e.message || e); }
   if (raf) cancelAnimationFrame(raf);
   // If the user switched/cleared conversations mid-stream, this turn no longer belongs here.
-  if (currentConvId !== convId0) { setSending(false); controller = null; return null; }
+  if (currentConvId !== convId0) { setSending(false); controller = null; if (!voiceMode) setActivity("", ""); return null; }
   if (gotContent) wrap.querySelector(".think").open = false;
   setReasoning(wrap, gotContent ? "" : reasoning);
   if (err) {
     history.pop();
     setContent(wrap, "", false, false);
     wrap.querySelector(".content").innerHTML = `<span style="color:var(--err)">⚠ ${escapeHtml(err)}</span>`;
+    if (!voiceMode) setActivity("", "");
     setSending(false); controller = null; return null;
   }
   setContent(wrap, answer, true, false);
@@ -756,11 +767,24 @@ async function _streamTurn(userContent, displayText, atts){
 
 // ── hands-free voice mode: listen (VAD) → STT → send → speak reply → repeat ────
 let voiceMode = false;
+// Prominent activity indicator + mic colour. kind: "listen" (red, mic hot) |
+// "work" (accent) | "" (hide).
+function setActivity(label, kind){
+  const mic = $("voicebtn");
+  if (mic) { mic.classList.toggle("hot", kind === "listen"); mic.classList.toggle("on", voiceMode && kind !== "listen"); }
+  const el = $("activity"); if (!el) return;
+  if (!label) { el.classList.add("hidden"); el.textContent = ""; return; }
+  el.className = "activity " + (kind || "work");
+  el.innerHTML = `<span class="adot"></span>${escapeHtml(label)}`;
+}
 function voiceStatus(s){
   const who = currentTeacher ? currentTeacher.name : "Assistant";
-  const b = $("voicebtn"); if (b) b.title = voiceMode ? `Voice (${who}): ${s || "on"} — click to stop` : "Voice conversation — click to talk";
-  $("hint").textContent = voiceMode ? `🎤 ${who} — ${s || "listening"} · click 🎤 to stop`
-                                    : "Enter to send · 📎 attach · 🎤 talk · pick a tutor in the top bar";
+  const b = $("voicebtn"); if (b) b.title = voiceMode ? `Voice (${who}) — click to stop` : "Voice conversation — click to talk";
+  if (!voiceMode) { setActivity("", ""); return; }
+  const t = s || "on";
+  const listening = /listen|waiting/.test(t);
+  const icon = listening ? "🔴" : /transcrib/.test(t) ? "✍️" : /think/.test(t) ? "💭" : /speak/.test(t) ? "🔊" : "🎤";
+  setActivity(`${icon} ${who} · ${t}`, listening ? "listen" : "work");
 }
 function speakText(text, voice){
   return new Promise(async (resolve) => {
@@ -839,7 +863,6 @@ async function voiceLoop(){
       const text = await transcribeBlob(blob, currentTeacher?.code);
       if (!voiceMode) break;
       if (!text) continue;
-      addBubble("system").querySelector(".content").innerHTML = `<span style="color:var(--text-dim)">🎙️ “${escapeHtml(text)}”</span>`; scrollDown();
       voiceStatus("thinking…");
       const answer = await streamTurn(text, text, []);
       if (!voiceMode) break;
