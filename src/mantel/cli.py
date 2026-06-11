@@ -53,21 +53,22 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def _start_server_thread(cfg: cfgmod.Config) -> bool:
-    """Start mantel's server in a daemon thread (so it dies with the window).
-    Returns True once it's serving — or was already up (e.g. a `mantel serve`)."""
+def _ensure_server(cfg: cfgmod.Config) -> bool:
+    """Ensure mantel's server is up, starting it as a DETACHED process if needed.
+
+    The server must outlive the launcher. Chrome's single-instance reuse makes the
+    spawned browser process exit immediately when a window for the profile already
+    exists (e.g. a leftover Chrome from a prior session), and the previous
+    in-process daemon-thread server died with it — the freshly-opened window then
+    loaded a dead port ("first launch refused, second works"). A detached
+    `mantel serve` survives independently and is reused on the next open, so the
+    window always finds a live server. Returns True once it's serving."""
     if _server_up(cfg):
         return True
-    import uvicorn
-
-    from .app import create_app
-
-    server = uvicorn.Server(uvicorn.Config(
-        create_app(cfg), host=cfg.host, port=cfg.port, log_level="warning"))
-    threading.Thread(target=server.run, daemon=True).start()
-    # Wait generously: a cold first launch (fresh .pyc + the MCP SDK import) can
-    # take well over a dozen seconds, and opening the window before the server is
-    # reachable shows the user ERR_CONNECTION_REFUSED. Returns as soon as it's up.
+    subprocess.Popen([sys.executable, "-m", "mantel", "serve"],
+                     start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Cold start can take a while (fresh .pyc + the MCP SDK import); poll until up.
     deadline = time.monotonic() + 45.0
     while time.monotonic() < deadline:
         if _server_up(cfg):
@@ -78,9 +79,7 @@ def _start_server_thread(cfg: cfgmod.Config) -> bool:
 
 def cmd_open(args: argparse.Namespace) -> int:
     cfg = cfgmod.load()
-    if not _start_server_thread(cfg):
-        # Don't open a window onto a dead port (that's the "first launch refuses,
-        # second works" symptom). Surface the real error instead.
+    if not _ensure_server(cfg):
         print(f"mantel's server didn't come up on {cfg.host}:{cfg.port}. "
               f"Run `mantel serve` to see the error, or change `port` via "
               f"`mantel config edit`.", file=sys.stderr)
