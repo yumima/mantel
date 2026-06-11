@@ -105,6 +105,10 @@
     color: var(--text-dim); font-size: 16px; display: grid; place-items: center; padding: 0; }
   #mic:hover { color: var(--accent); }
   #mic.rec { color: var(--err); animation: blink 1s steps(2) infinite; }
+  #voicebtn { flex: 0 0 auto; width: 32px; height: 36px; background: transparent; border: 0; cursor: pointer;
+    color: var(--text-dim); font-size: 16px; display: grid; place-items: center; padding: 0; }
+  #voicebtn:hover { color: var(--accent); }
+  #voicebtn.on { color: var(--ok); animation: blink 1.4s steps(2) infinite; }
   .attachbar { max-width: var(--maxw); margin: 0 auto 8px; display: flex; flex-wrap: wrap; gap: 6px; }
   .attachbar.hidden { display: none; }
   .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg-input);
@@ -179,6 +183,7 @@
       <input type="file" id="file" multiple hidden
              accept="image/*,.pdf,.docx,.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.log,.py,.js,.ts,.tsx,.html,.css,.sh,.c,.cpp,.h,.rs,.go,.java,.rb,.toml,.ini,.xml,.sql">
       <button id="mic" title="Voice input (speak → text)">🎤</button>
+      <button id="voicebtn" title="Hands-free voice mode">🎙️</button>
       <textarea id="input" rows="1" placeholder="Message…   ( type / for commands )" autofocus></textarea>
       <button id="send" title="Send">↑</button>
     </div>
@@ -685,15 +690,22 @@ async function send(){
   } else {
     userContent = text;
   }
+  await streamTurn(userContent, text, atts);
+  $("input").focus();
+}
+
+// Core turn: push the user message, stream the assistant reply, render + persist.
+// Returns the answer text ("" / null on error or nav-away). Reused by send() and
+// the hands-free voice loop.
+async function streamTurn(userContent, displayText, atts){
   if (!currentConvId) currentConvId = _uuid();
   const convId0 = currentConvId;   // pin this turn to its conversation
   history.push({ role: "user", content: userContent });
-  renderUserBubble(addBubble("user"), text, atts); scrollDown();
+  renderUserBubble(addBubble("user"), displayText, atts); scrollDown();
   const wrap = addBubble("assistant");
   let answer = "", reasoning = "", gotContent = false, err = null;
   setContent(wrap, "", false, true); scrollDown();
-  // Deep-think off → hearth's `think:false` fast lane (a no-op on non-hearth
-  // backends in M0; M1 makes this provider-aware). On → default reasoning.
+  // Deep-think off → hearth's `think:false` fast lane (a no-op on non-hearth backends).
   const req = deepThink ? { model, messages: history, stream: true }
                         : { model, messages: history, stream: true, think: false };
   setSending(true); controller = new AbortController();
@@ -730,22 +742,109 @@ async function send(){
     }
   } catch (e) { if (e.name !== "AbortError") err = String(e.message || e); }
   if (raf) cancelAnimationFrame(raf);
-  // If the user switched/cleared conversations mid-stream, this turn's history and
-  // DOM no longer belong here — bail without mutating or saving the wrong chat.
-  if (currentConvId !== convId0) { setSending(false); controller = null; return; }
+  // If the user switched/cleared conversations mid-stream, this turn no longer belongs here.
+  if (currentConvId !== convId0) { setSending(false); controller = null; return null; }
   if (gotContent) wrap.querySelector(".think").open = false;
   setReasoning(wrap, gotContent ? "" : reasoning);
   if (err) {
     history.pop();
     setContent(wrap, "", false, false);
     wrap.querySelector(".content").innerHTML = `<span style="color:var(--err)">⚠ ${escapeHtml(err)}</span>`;
-    setSending(false); controller = null; return;
+    setSending(false); controller = null; return null;
   }
   setContent(wrap, answer, true, false);
   if (answer) { history.push({ role: "assistant", content: answer }); addSpeakBtn(wrap, answer); saveChat(); }
   else { history.pop(); wrap.remove(); }
-  setSending(false); controller = null; $("input").focus();
+  setSending(false); controller = null;
+  return answer;
 }
+
+// ── hands-free voice mode: listen (VAD) → STT → send → speak reply → repeat ────
+let voiceMode = false;
+function voiceStatus(s){
+  const b = $("voicebtn"); if (b) b.title = voiceMode ? ("Voice mode: " + (s || "on") + " — click to stop") : "Hands-free voice mode";
+  $("hint").textContent = voiceMode ? `🎙️ ${s || "on"} — click 🎙️ to stop` : "Enter to send · Shift+Enter newline · 📎 attach · 🎙️ voice";
+}
+function speakText(text){
+  return new Promise(async (resolve) => {
+    try {
+      const r = await fetch("/api/speak", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+      if (!r.ok) { resolve(); return; }
+      const url = URL.createObjectURL(await r.blob());
+      const a = new Audio(url); ttsAudio = a;
+      const done = () => { if (ttsAudio === a) ttsAudio = null; URL.revokeObjectURL(url); resolve(); };
+      a.onended = done; a.onerror = done;
+      a.play().catch(done);
+    } catch { resolve(); }
+  });
+}
+// Record until the user stops talking (simple RMS VAD). Resolves to an audio Blob,
+// or null if aborted / nothing said.
+function listenWithVAD(maxMs = 15000, silenceMs = 1200){
+  return new Promise(async (resolve) => {
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch { resolve(null); return; }
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    try { await ctx.resume(); } catch {}
+    const analyser = ctx.createAnalyser(); analyser.fftSize = 512;
+    ctx.createMediaStreamSource(stream).connect(analyser);
+    const rec = new MediaRecorder(stream); const chunks = [];
+    rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    const data = new Uint8Array(analyser.fftSize);
+    let spoke = false, lastLoud = performance.now(), start = performance.now(), raf = 0;
+    const finish = (aborted) => {
+      if (raf) cancelAnimationFrame(raf);
+      try { stream.getTracks().forEach(t => t.stop()); } catch {}
+      ctx.close().catch(() => {});
+      rec.onstop = () => resolve(aborted ? null : new Blob(chunks, { type: rec.mimeType || "audio/webm" }));
+      try { if (rec.state !== "inactive") rec.stop(); else resolve(aborted ? null : new Blob(chunks)); } catch { resolve(null); }
+    };
+    const tick = () => {
+      if (!voiceMode) { finish(true); return; }
+      analyser.getByteTimeDomainData(data);
+      let sum = 0; for (const v of data) { const x = (v - 128) / 128; sum += x * x; }
+      const rms = Math.sqrt(sum / data.length), now = performance.now();
+      if (rms > 0.045) { spoke = true; lastLoud = now; }
+      voiceStatus(spoke ? "listening…" : "waiting for you to speak…");
+      if ((spoke && now - lastLoud > silenceMs) || now - start > maxMs) { finish(false); return; }
+      raf = requestAnimationFrame(tick);
+    };
+    rec.start(); raf = requestAnimationFrame(tick);
+  });
+}
+async function transcribeBlob(blob){
+  try {
+    const fd = new FormData(); fd.append("file", blob, "speech.webm");
+    const r = await fetch("/api/transcribe", { method: "POST", body: fd });
+    const j = await r.json().catch(() => ({}));
+    return r.ok ? (j.text || "").trim() : "";
+  } catch { return ""; }
+}
+async function voiceLoop(){
+  while (voiceMode) {
+    const blob = await listenWithVAD();
+    if (!voiceMode) break;
+    if (!blob || blob.size < 1600) continue;            // nothing / too short
+    voiceStatus("transcribing…");
+    const text = await transcribeBlob(blob);
+    if (!voiceMode) break;
+    if (!text) continue;
+    addBubble("system").querySelector(".content").innerHTML = `<span style="color:var(--text-dim)">🎙️ “${escapeHtml(text)}”</span>`; scrollDown();
+    voiceStatus("thinking…");
+    const answer = await streamTurn(text, text, []);
+    if (!voiceMode) break;
+    if (answer && answer.trim()) { voiceStatus("speaking…"); await speakText(answer); }
+  }
+  voiceStatus("");
+}
+function toggleVoiceMode(){
+  voiceMode = !voiceMode;
+  $("voicebtn").classList.toggle("on", voiceMode);
+  if (voiceMode) { voiceStatus("starting…"); voiceLoop(); }
+  else { if (ttsAudio) { try { ttsAudio.pause(); } catch {} } if (streaming) controller?.abort(); }
+}
+$("voicebtn").addEventListener("click", toggleVoiceMode);
 
 function autogrow(){ const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 200) + "px"; }
 $("input").addEventListener("input", () => { autogrow(); updatePalette(); });
