@@ -65,20 +65,26 @@ def _start_server_thread(cfg: cfgmod.Config) -> bool:
     server = uvicorn.Server(uvicorn.Config(
         create_app(cfg), host=cfg.host, port=cfg.port, log_level="warning"))
     threading.Thread(target=server.run, daemon=True).start()
-    deadline = time.monotonic() + 12.0
+    # Wait generously: a cold first launch (fresh .pyc + the MCP SDK import) can
+    # take well over a dozen seconds, and opening the window before the server is
+    # reachable shows the user ERR_CONNECTION_REFUSED. Returns as soon as it's up.
+    deadline = time.monotonic() + 45.0
     while time.monotonic() < deadline:
         if _server_up(cfg):
             return True
-        time.sleep(0.1)
+        time.sleep(0.2)
     return False
 
 
 def cmd_open(args: argparse.Namespace) -> int:
     cfg = cfgmod.load()
     if not _start_server_thread(cfg):
-        print(f"warning: mantel's server didn't come up on {cfg.host}:{cfg.port} "
-              f"(port already in use by another app?). Run `mantel serve` to see the "
-              f"error, or change `port` via `mantel config edit`.", file=sys.stderr)
+        # Don't open a window onto a dead port (that's the "first launch refuses,
+        # second works" symptom). Surface the real error instead.
+        print(f"mantel's server didn't come up on {cfg.host}:{cfg.port}. "
+              f"Run `mantel serve` to see the error, or change `port` via "
+              f"`mantel config edit`.", file=sys.stderr)
+        return 1
     from . import desktop
     return desktop.open_window(_server_url(cfg))
 
@@ -197,6 +203,10 @@ def _example_mcp_servers() -> dict:
         # Built-in: fetch a web page/API by URL (readable text).
         "web": ServerConfig(
             command=sys.executable, args=["-m", "mantel.mcp_servers.web"],
+            enabled=False, auto_approve=["*"]),
+        # Built-in: text-to-image (ComfyUI/SDXL via hearth /v1/images/generations).
+        "image": ServerConfig(
+            command=sys.executable, args=["-m", "mantel.mcp_servers.image"],
             enabled=False, auto_approve=["*"]),
     }
 

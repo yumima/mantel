@@ -519,9 +519,14 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
                         yield _tool_frame("call", cid, name, {"arguments": args})
                         h = app.state.host  # read fresh — a concurrent reload may have swapped it
                         res = await h.call(name, args) if h else {"ok": False, "content": "MCP host unavailable"}
-                        yield _tool_frame("result", cid, name, res)
-                        messages.append({"role": "tool", "tool_call_id": cid,
-                                         "content": res.get("content", "")})
+                        yield _tool_frame("result", cid, name, res)  # full result (inline images) → UI
+                        tool_content = res.get("content", "")
+                        # A generated image returns as a ~2 MB data: URL — render it for the
+                        # user (frame above) but feed the model only a short placeholder so it
+                        # doesn't blow up the context (and the model can't read base64 anyway).
+                        if isinstance(tool_content, str) and tool_content.startswith("data:image/"):
+                            tool_content = "[image generated and shown to the user]"
+                        messages.append({"role": "tool", "tool_call_id": cid, "content": tool_content})
                 else:
                     yield _tool_frame("note", "", "", {"content": f"stopped after {MAX_TOOL_ROUNDS} tool rounds"})
                 yield b"data: [DONE]\n\n"

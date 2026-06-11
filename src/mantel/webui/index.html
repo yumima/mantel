@@ -71,6 +71,7 @@
   .tool code { color: var(--accent); background: none; font-size: 12px; }
   .tool .ok { color: var(--ok); } .tool .no { color: var(--err); }
   .tool.note { font-style: italic; }
+  .tool .genimg { display: block; max-width: 360px; max-height: 360px; border-radius: 8px; margin-top: 8px; border: 1px solid var(--border); }
   .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
   #empty { max-width: var(--maxw); margin: 16vh auto 0; text-align: center; color: var(--text-dim); padding: 0 16px; }
@@ -270,8 +271,17 @@ function renderTool(wrap, ev){
   } else if (ev.phase === "result") {
     const row = [...tools.querySelectorAll(".tool[data-tid]")].reverse().find(r => r.dataset.tid === (ev.id || "")) || tools.lastElementChild;
     const icon = ev.denied ? "⛔" : (ev.ok ? "✓" : "✗");
-    const snip = String(ev.content || "").replace(/\s+/g, " ").slice(0, 140);
-    if (row && row.querySelector(".tr")) row.querySelector(".tr").innerHTML = ` <span class="${ev.ok ? "ok" : "no"}">${icon}</span> ${escapeHtml(snip)}`;
+    const content = String(ev.content || "");
+    const img = content.match(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/);
+    if (row && row.querySelector(".tr")) {
+      if (img) {                                   // generated image → render inline
+        row.querySelector(".tr").innerHTML = ` <span class="ok">${icon}</span> image`;
+        const el = document.createElement("img"); el.className = "genimg"; el.src = img[0]; row.appendChild(el);
+      } else {
+        const snip = content.replace(/\s+/g, " ").slice(0, 140);
+        row.querySelector(".tr").innerHTML = ` <span class="${ev.ok ? "ok" : "no"}">${icon}</span> ${escapeHtml(snip)}`;
+      }
+    }
   } else if (ev.phase === "note") {
     const row = document.createElement("div"); row.className = "tool note"; row.textContent = ev.content || ""; tools.appendChild(row);
   }
