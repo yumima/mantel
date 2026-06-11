@@ -101,12 +101,8 @@
   #attach { flex: 0 0 auto; width: 32px; height: 36px; background: transparent; border: 0; cursor: pointer;
     color: var(--text-dim); font-size: 17px; display: grid; place-items: center; padding: 0; }
   #attach:hover { color: var(--accent); }
-  #mic { flex: 0 0 auto; width: 32px; height: 36px; background: transparent; border: 0; cursor: pointer;
-    color: var(--text-dim); font-size: 16px; display: grid; place-items: center; padding: 0; }
-  #mic:hover { color: var(--accent); }
-  #mic.rec { color: var(--err); animation: blink 1s steps(2) infinite; }
   #voicebtn { flex: 0 0 auto; width: 32px; height: 36px; background: transparent; border: 0; cursor: pointer;
-    color: var(--text-dim); font-size: 16px; display: grid; place-items: center; padding: 0; }
+    color: var(--text-dim); font-size: 17px; display: grid; place-items: center; padding: 0; }
   #voicebtn:hover { color: var(--accent); }
   #voicebtn.on { color: var(--ok); animation: blink 1.4s steps(2) infinite; }
   .attachbar { max-width: var(--maxw); margin: 0 auto 8px; display: flex; flex-wrap: wrap; gap: 6px; }
@@ -166,6 +162,7 @@
     <button class="btn" id="chatsbtn" title="Conversations">Chats</button>
     <span class="spacer"></span>
     <select id="model" title="Model"></select>
+    <select id="partner" title="Voice/chat partner — Assistant or a language tutor"></select>
     <button class="toggle on" id="think" title="Deep-think (hearth): reason before answering. Off = fast lane.">💭 Think</button>
     <span class="status"><span class="dot" id="dot"></span><span id="statusText">…</span></span>
     <button class="btn" id="cfgbtn" title="Tools &amp; settings">⚙</button>
@@ -182,8 +179,7 @@
       <button id="attach" title="Attach image or document">📎</button>
       <input type="file" id="file" multiple hidden
              accept="image/*,.pdf,.docx,.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.log,.py,.js,.ts,.tsx,.html,.css,.sh,.c,.cpp,.h,.rs,.go,.java,.rb,.toml,.ini,.xml,.sql">
-      <button id="mic" title="Voice input (speak → text)">🎤</button>
-      <button id="voicebtn" title="Hands-free voice mode">🎙️</button>
+      <button id="voicebtn" title="Voice conversation — click to talk, click again to stop">🎤</button>
       <textarea id="input" rows="1" placeholder="Message…   ( type / for commands )" autofocus></textarea>
       <button id="send" title="Send">↑</button>
     </div>
@@ -581,43 +577,19 @@ async function speak(btn, text){
   } catch { btn.textContent = "🔊"; }
 }
 
-// ── voice input (mic → /api/transcribe → composer) ────────────────────────────
-let mediaRec = null, recChunks = [], recStream = null;
-async function toggleMic(){
-  const btn = $("mic");
-  if (mediaRec && mediaRec.state === "recording") { mediaRec.stop(); return; }
-  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-    sysMsg("⚠ microphone/recording not available in this browser"); return;
-  }
-  try { recStream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
-  catch (e) { sysMsg(`⚠ mic permission denied: ${escapeHtml(String(e.message || e))}`); return; }
-  recChunks = [];
-  try { mediaRec = new MediaRecorder(recStream); }
-  catch (e) {
-    recStream.getTracks().forEach(t => t.stop()); recStream = null;   // don't leave the mic live
-    sysMsg(`⚠ recording unsupported here: ${escapeHtml(String(e.message || e))}`); return;
-  }
-  mediaRec.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
-  mediaRec.onstop = async () => {
-    recStream.getTracks().forEach(t => t.stop()); recStream = null;
-    btn.classList.remove("rec"); btn.textContent = "🎤"; btn.title = "Voice input (speak → text)";
-    const blob = new Blob(recChunks, { type: (mediaRec && mediaRec.mimeType) || "audio/webm" });
-    if (!blob.size) return;
-    btn.textContent = "…";
-    try {
-      const fd = new FormData(); fd.append("file", blob, "speech.webm");
-      const r = await fetch("/api/transcribe", { method: "POST", body: fd });
-      const j = await r.json().catch(() => ({}));
-      btn.textContent = "🎤";
-      if (!r.ok) { sysMsg(`⚠ ${escapeHtml(j.error || "transcription failed")}`); return; }
-      const t = (j.text || "").trim();
-      if (t) { const inp = $("input"); inp.value = (inp.value ? inp.value.trim() + " " : "") + t; autogrow(); inp.focus(); }
-    } catch (e) { btn.textContent = "🎤"; sysMsg(`⚠ ${escapeHtml(String(e.message || e))}`); }
-  };
-  mediaRec.start();
-  btn.classList.add("rec"); btn.textContent = "⏺"; btn.title = "Stop & transcribe";
+// ── voice/chat partner selector (Assistant, or a language tutor) ──────────────
+function populatePartners(){
+  const sel = $("partner"); if (!sel) return;
+  sel.innerHTML = "";
+  const add = (v, l) => { const o = document.createElement("option"); o.value = v; o.textContent = l; sel.appendChild(o); };
+  add("", "🗣 Assistant");
+  for (const t of TEACHERS) add(t.code, "🎓 " + t.name + " tutor");
+  sel.value = currentTeacher ? currentTeacher.code : "";
 }
-$("mic").addEventListener("click", toggleMic);
+$("partner").addEventListener("change", (e) => {
+  setTeacher(TEACHERS.find(x => x.code === e.target.value) || null);
+});
+populatePartners();
 
 // A leading "/" is a COMMAND only when it's actually one — an arg-command
 // (/model …, /enable …) or a no-arg command typed alone (/help, /clear). Anything
@@ -776,8 +748,10 @@ async function streamTurn(userContent, displayText, atts){
 // ── hands-free voice mode: listen (VAD) → STT → send → speak reply → repeat ────
 let voiceMode = false;
 function voiceStatus(s){
-  const b = $("voicebtn"); if (b) b.title = voiceMode ? ("Voice mode: " + (s || "on") + " — click to stop") : "Hands-free voice mode";
-  $("hint").textContent = voiceMode ? `🎙️ ${s || "on"} — click 🎙️ to stop` : "Enter to send · Shift+Enter newline · 📎 attach · 🎙️ voice";
+  const who = currentTeacher ? currentTeacher.name : "Assistant";
+  const b = $("voicebtn"); if (b) b.title = voiceMode ? `Voice (${who}): ${s || "on"} — click to stop` : "Voice conversation — click to talk";
+  $("hint").textContent = voiceMode ? `🎤 ${who} — ${s || "listening"} · click 🎤 to stop`
+                                    : "Enter to send · 📎 attach · 🎤 talk · pick a tutor in the top bar";
 }
 function speakText(text, voice){
   return new Promise(async (resolve) => {
@@ -797,7 +771,7 @@ function speakText(text, voice){
 function listenWithVAD(maxMs = 15000, silenceMs = 1200){
   return new Promise(async (resolve) => {
     let stream;
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
     catch { resolve(null); return; }
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     try { await ctx.resume(); } catch {}
@@ -933,6 +907,7 @@ $("chatsNew").addEventListener("click", () => { if (streaming) controller?.abort
 
 function setTeacher(t){
   currentTeacher = t;
+  const sel = $("partner"); if (sel) sel.value = t ? t.code : "";   // keep header dropdown in sync
   if (!$("cfgPanel").classList.contains("hidden")) refreshCfg();
   if (t) {
     addBubble("system").querySelector(".content").innerHTML =
