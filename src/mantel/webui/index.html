@@ -680,7 +680,16 @@ async function send(){
 // Core turn: push the user message, stream the assistant reply, render + persist.
 // Returns the answer text ("" / null on error or nav-away). Reused by send() and
 // the hands-free voice loop.
+let turnInFlight = false;
 async function streamTurn(userContent, displayText, atts){
+  // Serialize turns so a manual send and the voice loop never interleave on the
+  // shared history / controller / streaming state.
+  while (turnInFlight) await new Promise(r => setTimeout(r, 60));
+  turnInFlight = true;
+  try { return await _streamTurn(userContent, displayText, atts); }
+  finally { turnInFlight = false; }
+}
+async function _streamTurn(userContent, displayText, atts){
   if (!currentConvId) currentConvId = _uuid();
   const convId0 = currentConvId;   // pin this turn to its conversation
   history.push({ role: "user", content: userContent });
@@ -780,13 +789,17 @@ function listenWithVAD(maxMs = 15000, silenceMs = 1200){
     const rec = new MediaRecorder(stream); const chunks = [];
     rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
     const data = new Uint8Array(analyser.fftSize);
-    let spoke = false, lastLoud = performance.now(), start = performance.now(), raf = 0;
+    let spoke = false, lastLoud = performance.now(), start = performance.now(), raf = 0, settled = false, backstop = 0;
     const finish = (aborted) => {
+      if (settled) return; settled = true;                 // resolve exactly once
       if (raf) cancelAnimationFrame(raf);
+      if (backstop) clearTimeout(backstop);
       try { stream.getTracks().forEach(t => t.stop()); } catch {}
       ctx.close().catch(() => {});
-      rec.onstop = () => resolve(aborted ? null : new Blob(chunks, { type: rec.mimeType || "audio/webm" }));
-      try { if (rec.state !== "inactive") rec.stop(); else resolve(aborted ? null : new Blob(chunks)); } catch { resolve(null); }
+      const blob = () => new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+      rec.onstop = () => resolve(aborted ? null : blob());
+      try { if (rec.state !== "inactive") rec.stop(); else resolve(aborted ? null : blob()); }
+      catch { resolve(aborted ? null : blob()); }
     };
     const tick = () => {
       if (!voiceMode) { finish(true); return; }
@@ -798,6 +811,9 @@ function listenWithVAD(maxMs = 15000, silenceMs = 1200){
       if ((spoke && now - lastLoud > silenceMs) || now - start > maxMs) { finish(false); return; }
       raf = requestAnimationFrame(tick);
     };
+    // Hard backstop: requestAnimationFrame pauses when the tab is backgrounded, so a
+    // timer guarantees cleanup + a result even if the rAF tick never fires.
+    backstop = setTimeout(() => finish(!spoke), maxMs + 1500);
     rec.start(); raf = requestAnimationFrame(tick);
   });
 }
@@ -810,22 +826,26 @@ async function transcribeBlob(blob, language){
     return r.ok ? (j.text || "").trim() : "";
   } catch { return ""; }
 }
+let voiceLoopRunning = false;
 async function voiceLoop(){
-  while (voiceMode) {
-    const blob = await listenWithVAD();
-    if (!voiceMode) break;
-    if (!blob || blob.size < 1600) continue;            // nothing / too short
-    voiceStatus("transcribing…");
-    const text = await transcribeBlob(blob, currentTeacher?.code);
-    if (!voiceMode) break;
-    if (!text) continue;
-    addBubble("system").querySelector(".content").innerHTML = `<span style="color:var(--text-dim)">🎙️ “${escapeHtml(text)}”</span>`; scrollDown();
-    voiceStatus("thinking…");
-    const answer = await streamTurn(text, text, []);
-    if (!voiceMode) break;
-    if (answer && answer.trim()) { voiceStatus("speaking…"); await speakText(answer, currentTeacher?.voice); }
-  }
-  voiceStatus("");
+  if (voiceLoopRunning) return;                          // never run two loops at once
+  voiceLoopRunning = true;
+  try {
+    while (voiceMode) {
+      const blob = await listenWithVAD();
+      if (!voiceMode) break;
+      if (!blob || blob.size < 1600) continue;            // nothing / too short
+      voiceStatus("transcribing…");
+      const text = await transcribeBlob(blob, currentTeacher?.code);
+      if (!voiceMode) break;
+      if (!text) continue;
+      addBubble("system").querySelector(".content").innerHTML = `<span style="color:var(--text-dim)">🎙️ “${escapeHtml(text)}”</span>`; scrollDown();
+      voiceStatus("thinking…");
+      const answer = await streamTurn(text, text, []);
+      if (!voiceMode) break;
+      if (answer && answer.trim()) { voiceStatus("speaking…"); await speakText(answer, currentTeacher?.voice); }
+    }
+  } finally { voiceLoopRunning = false; voiceStatus(""); }
 }
 function toggleVoiceMode(){
   voiceMode = !voiceMode;
