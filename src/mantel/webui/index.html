@@ -171,7 +171,7 @@
     <span class="spacer"></span>
     <select id="model" title="Model"></select>
     <select id="partner" title="Voice/chat partner — Assistant or a language tutor"></select>
-    <button class="toggle on" id="think" title="Deep-think (hearth): reason before answering. Off = fast lane.">💭 Think</button>
+    <button class="toggle" id="think" title="Fast by default. Click for deep-think: the model reasons before answering (better for hard questions, but slower).">⚡ Fast</button>
     <span class="status"><span class="dot" id="dot"></span><span id="statusText">…</span></span>
     <button class="btn" id="cfgbtn" title="Tools &amp; settings">⚙</button>
     <button class="btn" id="newchat" title="New conversation">New</button>
@@ -214,7 +214,7 @@
 const $ = (id) => document.getElementById(id);
 let history = [];
 let model = null;
-let deepThink = true;
+let deepThink = false;   // default to the fast lane (no long reasoning chain) — toggle 💭 for deep-think
 let controller = null;
 let streaming = false;
 let attachments = [];   // pending: {kind:"image", url, name} | {kind:"doc", name, text, chars}
