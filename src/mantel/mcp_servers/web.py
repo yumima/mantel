@@ -10,14 +10,45 @@ Run standalone over stdio:  python -m mantel.mcp_servers.web
 
 from __future__ import annotations
 
+import ipaddress
+import os
 import re
+import socket
 from html.parser import HTMLParser
+from urllib.parse import urlparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
 MAX_CHARS = 20000
+_MAX_REDIRECTS = 5
+# Allow fetching private/loopback hosts only with an explicit opt-in.
+_ALLOW_PRIVATE = os.environ.get("MANTEL_FETCH_ALLOW_PRIVATE", "").lower() in ("1", "true", "yes")
 _SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "head"}
+
+
+def _host_is_blocked(host: str) -> bool:
+    """SSRF guard: block hosts that resolve to a private/loopback/link-local/
+    reserved address. On this box hearth, Ollama, finterm and mantel itself all
+    listen on loopback — an LLM-driven fetch must not be able to reach them (or
+    cloud metadata at 169.254.169.254). Unresolvable → blocked."""
+    if _ALLOW_PRIVATE:
+        return False
+    if not host:
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, ValueError):
+        return True  # can't resolve → refuse
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return True
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return True
+    return False
 
 
 class _TextExtractor(HTMLParser):
@@ -51,12 +82,26 @@ def _html_to_text(html: str) -> str:
 
 
 def _do_fetch(url: str, max_chars: int = MAX_CHARS) -> dict:
-    if not re.match(r"^https?://", url, re.I):
-        return {"error": "only http(s) URLs are allowed"}
+    # Follow redirects manually so each hop's host is re-validated (a public URL
+    # can 30x to http://127.0.0.1/...). httpx auto-redirects would bypass the check.
+    target = url
     try:
-        with httpx.Client(timeout=30.0, follow_redirects=True,
+        with httpx.Client(timeout=30.0, follow_redirects=False,
                           headers={"User-Agent": "mantel-fetch/0.1"}) as client:
-            r = client.get(url)
+            for _ in range(_MAX_REDIRECTS + 1):
+                if not re.match(r"^https?://", target, re.I):
+                    return {"error": "only http(s) URLs are allowed"}
+                host = urlparse(target).hostname or ""
+                if _host_is_blocked(host):
+                    return {"error": f"refused: '{host}' resolves to a private/loopback/"
+                                     f"reserved address (set MANTEL_FETCH_ALLOW_PRIVATE=1 to override)"}
+                r = client.get(target)
+                if r.is_redirect and r.headers.get("location"):
+                    target = str(r.url.join(r.headers["location"]))
+                    continue
+                break
+            else:
+                return {"error": "too many redirects"}
     except httpx.HTTPError as e:
         return {"error": f"fetch failed: {e}"}
     ctype = r.headers.get("content-type", "")
