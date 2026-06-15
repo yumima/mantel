@@ -50,6 +50,8 @@ then your default browser.
 | `mantel mcp list\|tools\|enable <n>\|disable <n>` | manage MCP servers |
 | `mantel provider list\|use <n>` | manage backends |
 | `mantel serve` | run the local server in the foreground (headless / dev) |
+| `mantel stop` / `restart` | stop / restart the local server |
+| `mantel logs [-f]` | show (or follow) the local server log |
 | `mantel install` / `uninstall` | add / remove the clickable desktop launcher |
 
 ## Architecture

@@ -2,6 +2,9 @@
 
   mantel            open the desktop chat window (starts mantel's local server)
   mantel serve      run the local server in the foreground (headless / dev)
+  mantel stop       stop the local server
+  mantel restart    restart the local server
+  mantel logs [-f]  show (or follow) the local server log
   mantel install    add a clickable desktop launcher (app menu / Start menu)
   mantel uninstall  remove the launcher
 
@@ -15,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -40,6 +44,48 @@ def _server_up(cfg: cfgmod.Config, timeout: float = 0.5) -> bool:
         return False
 
 
+def _read_pid() -> int | None:
+    """The PID of a live mantel server from the pidfile, or None if the file is
+    absent/garbage or the process is gone (stale pidfile)."""
+    try:
+        pid = int(cfgmod.pid_path().read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)  # signal 0 = existence check, doesn't actually signal
+    except ProcessLookupError:
+        return None  # stale
+    except PermissionError:
+        return pid  # exists but not ours (shouldn't happen on loopback/same user)
+    return pid
+
+
+def _pid_is_mantel(pid: int) -> bool:
+    """Best-effort check that `pid` really is a mantel process, so a stale pidfile
+    whose PID the OS has since recycled can't make `stop` signal an unrelated
+    process. A hung mantel still matches (its cmdline is unchanged), so this
+    doesn't block killing one. On platforms without /proc we can't tell — assume
+    yes and fall back to the pidfile's word."""
+    try:
+        return b"mantel" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return True
+
+
+def _open_server_log():
+    """Open the server log for append, rotating once when it grows past ~2 MB so a
+    long-lived daemon can't fill the disk. Returns a file object (or None on error,
+    in which case the caller should fall back to DEVNULL)."""
+    lp = cfgmod.log_path()
+    try:
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        if lp.exists() and lp.stat().st_size > 2_000_000:
+            lp.replace(lp.with_name(lp.name + ".1"))
+        return open(lp, "a", buffering=1, encoding="utf-8")
+    except OSError:
+        return None
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -48,8 +94,27 @@ def cmd_serve(args: argparse.Namespace) -> int:
     cfg = cfgmod.load()
     print(f"[mantel] serving http://{cfg.host}:{cfg.port}  (backend: {cfg.active().base_url})")
     print(f"[mantel] open the UI at {_server_url(cfg)}")
-    uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port,
-                log_level=getattr(args, "log_level", "info"))
+
+    # Record our PID so `mantel stop`/`restart` can find this server (works whether
+    # we were launched in the foreground or detached by _ensure_server). Remove it
+    # on exit, but only if it's still ours — a racing restart may have replaced it.
+    pid_file = cfgmod.pid_path()
+    try:
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pid_file = None  # non-fatal: serve anyway, just not stoppable via pidfile
+
+    try:
+        uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port,
+                    log_level=getattr(args, "log_level", "info"))
+    finally:
+        if pid_file is not None:
+            try:
+                if pid_file.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    pid_file.unlink()
+            except OSError:
+                pass
     return 0
 
 
@@ -65,9 +130,17 @@ def _ensure_server(cfg: cfgmod.Config) -> bool:
     window always finds a live server. Returns True once it's serving."""
     if _server_up(cfg):
         return True
-    subprocess.Popen([sys.executable, "-m", "mantel", "serve"],
-                     start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Send the detached server's output to a log file (was DEVNULL — which left no
+    # way to see why a start failed). `mantel logs` tails it.
+    log = _open_server_log()
+    out = log or subprocess.DEVNULL
+    try:
+        subprocess.Popen([sys.executable, "-m", "mantel", "serve"],
+                         start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
+    finally:
+        if log is not None:
+            log.close()  # child inherited the fd; parent doesn't need its copy
     # Cold start can take a while (fresh .pyc + the MCP SDK import); poll until up.
     deadline = time.monotonic() + 45.0
     while time.monotonic() < deadline:
@@ -86,6 +159,74 @@ def cmd_open(args: argparse.Namespace) -> int:
         return 1
     from . import desktop
     return desktop.open_window(_server_url(cfg))
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    cfg = cfgmod.load()
+    pid = _read_pid()
+    if pid is None:
+        cfgmod.pid_path().unlink(missing_ok=True)  # clear a stale pidfile
+        if _server_up(cfg):
+            print("a mantel server is running but no pid file was found "
+                  "(started by an older build?); stop it manually.", file=sys.stderr)
+            return 1
+        print("mantel is not running.")
+        return 0
+    if not _pid_is_mantel(pid):
+        cfgmod.pid_path().unlink(missing_ok=True)  # PID was recycled — not our server
+        print("mantel is not running (cleared a stale pid file).")
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        cfgmod.pid_path().unlink(missing_ok=True)
+        print("mantel is not running.")
+        return 0
+    # Wait for graceful shutdown; escalate to SIGKILL if it won't go.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.2)
+    else:
+        try:
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))  # SIGKILL is POSIX-only
+        except ProcessLookupError:
+            pass
+    cfgmod.pid_path().unlink(missing_ok=True)
+    print(f"stopped mantel (pid {pid}).")
+    return 0
+
+
+def cmd_restart(args: argparse.Namespace) -> int:
+    cmd_stop(args)
+    cfg = cfgmod.load()
+    if _ensure_server(cfg):
+        print(f"mantel restarted on {cfg.host}:{cfg.port}  ·  logs: {cfgmod.log_path()}")
+        return 0
+    print(f"mantel didn't come back up on {cfg.host}:{cfg.port} — see {cfgmod.log_path()}",
+          file=sys.stderr)
+    return 1
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    lp = cfgmod.log_path()
+    if not lp.exists():
+        print(f"no log yet at {lp}  (start the server with `mantel` or `mantel serve`).")
+        return 0
+    if getattr(args, "follow", False):
+        tail = shutil.which("tail")
+        if tail:
+            return subprocess.call([tail, "-n", "200", "-f", str(lp)])
+        print("(`tail` not found — showing the last 200 lines instead)\n", file=sys.stderr)
+    # Print the tail without slurping a large file into memory.
+    from collections import deque
+    with open(lp, encoding="utf-8", errors="replace") as f:
+        for line in deque(f, maxlen=200):
+            sys.stdout.write(line)
+    return 0
 
 
 def cmd_install(args: argparse.Namespace) -> int:
@@ -252,8 +393,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     ok, models = _probe_models(prov.base_url)
     print(f"mantel  ·  config: {cfgmod.config_path()}"
           f"{'' if cfgmod.config_path().exists() else '  (defaults)'}")
+    pid = _read_pid()
     print(f"  server:  http://{cfg.host}:{cfg.port}  "
-          f"({'running' if _server_up(cfg) else 'not running'})")
+          f"({('running, pid ' + str(pid)) if _server_up(cfg) else 'not running'})")
+    if _server_up(cfg):
+        print(f"  logs:    {cfgmod.log_path()}")
     print(f"  backend: {cfg.provider} → {prov.base_url}  "
           f"({str(len(models)) + ' models' if ok else 'unreachable'})")
     print(f"  model:   {cfg.model}")
@@ -389,6 +533,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_serve)
 
     sub.add_parser("open", help="open the desktop chat window").set_defaults(func=cmd_open)
+    sub.add_parser("stop", help="stop the local server").set_defaults(func=cmd_stop)
+    sub.add_parser("restart", help="restart the local server (stop, then start detached)") \
+       .set_defaults(func=cmd_restart)
+    lg = sub.add_parser("logs", help="show the local server log")
+    lg.add_argument("-f", "--follow", action="store_true", help="follow the log (tail -f)")
+    lg.set_defaults(func=cmd_logs)
     sub.add_parser("status", help="backend reachability, model, MCP servers + tools").set_defaults(func=cmd_status)
     sub.add_parser("doctor", help="diagnose the environment (backend, MCP runtimes, window)").set_defaults(func=cmd_doctor)
     sub.add_parser("models", help="list models from the active backend").set_defaults(func=cmd_models)

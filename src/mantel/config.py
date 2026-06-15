@@ -57,6 +57,21 @@ def config_path() -> Path:
     return Path(base) / "mantel" / "config.yaml"
 
 
+def state_dir() -> Path:
+    """Per-user state dir for runtime files (pidfile, server log). XDG default
+    is ~/.local/state/mantel — separate from config so it can be wiped safely."""
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "mantel"
+
+
+def pid_path() -> Path:
+    return state_dir() / "mantel.pid"
+
+
+def log_path() -> Path:
+    return state_dir() / "mantel.log"
+
+
 def load() -> Config:
     """Load config, falling back to all-defaults (hearth on :11435) when the file
     is absent or unreadable — mantel must never fail to start over config."""
