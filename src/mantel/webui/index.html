@@ -214,7 +214,19 @@
     color: var(--text-dim); font-size: 16px; display: grid; place-items: center; padding: 0; border-radius: 8px; }
   .compRow .cbtn:hover { color: var(--accent); background: var(--bg-elev); }
   #micbtn.hot { color: var(--err); animation: blink 0.9s steps(2) infinite; }
+  #wavebtn svg { display: block; }
   #wavebtn.on { color: var(--ok); }
+  #wavebtn.on svg { animation: voicepulse 1s ease-in-out infinite; }
+  @keyframes voicepulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+  /* hover labels for composer icon buttons (match the rail's .tip) */
+  #attach, #send, .compRow .cbtn { position: relative; }
+  .ctip { position: absolute; bottom: calc(100% + 7px); left: 50%;
+    transform: translateX(-50%) translateY(4px);
+    background: var(--bg-elev); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 3px 8px; font-size: 11px; line-height: 1.2;
+    white-space: nowrap; opacity: 0; pointer-events: none; z-index: 90;
+    transition: opacity .12s ease, transform .12s ease; }
+  button:hover > .ctip { opacity: 1; transform: translateX(-50%) translateY(0); }
 
   /* live-voice overlay */
   #live { position: fixed; inset: 0 0 0 var(--rail); z-index: 80; background: rgba(15,16,20,.96);
@@ -263,17 +275,17 @@
       <input type="file" id="file" multiple hidden
              accept="image/*,.pdf,.docx,.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.log,.py,.js,.ts,.tsx,.html,.css,.sh,.c,.cpp,.h,.rs,.go,.java,.rb,.toml,.ini,.xml,.sql">
       <div class="compInput">
-        <button id="attach" title="Attach image or document" aria-label="Attach">📎</button>
+        <button id="attach" title="Attach image or document" aria-label="Attach">📎<span class="ctip">Attach</span></button>
         <textarea id="input" rows="1" placeholder="Message…   ( type / for commands )" autofocus></textarea>
-        <button id="send" title="Send" aria-label="Send">↑</button>
+        <button id="send" title="Send" aria-label="Send">↑<span class="ctip">Send</span></button>
       </div>
       <div class="compRow">
         <select id="model" class="compsel" title="Model" aria-label="Model"></select>
         <select id="partner" hidden aria-hidden="true"></select>
         <button class="toggle compthink" id="think" title="Fast by default. Click for deep-think: the model reasons before answering (better for hard questions, but slower).">⚡ Fast</button>
         <span class="grow"></span>
-        <button class="cbtn" id="micbtn" title="Dictate — hold to speak, click to stop; text goes into the box" aria-label="Dictate to input">🎤</button>
-        <button class="cbtn" id="wavebtn" title="Live voice conversation — hands-free" aria-label="Live voice conversation">〰️</button>
+        <button class="cbtn" id="micbtn" title="Dictate — hold to speak, click to stop; text goes into the box" aria-label="Dictate to input"><span class="ico">🎤</span><span class="ctip">Dictate</span></button>
+        <button class="cbtn" id="wavebtn" title="Live voice conversation — hands-free" aria-label="Live voice conversation"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><rect x="1.3" y="8.5" width="2.6" height="7" rx="1.3"/><rect x="6" y="5" width="2.6" height="14" rx="1.3"/><rect x="10.7" y="2.5" width="2.6" height="19" rx="1.3"/><rect x="15.4" y="5" width="2.6" height="14" rx="1.3"/><rect x="20.1" y="8.5" width="2.6" height="7" rx="1.3"/></svg><span class="ctip">Live voice</span></button>
       </div>
     </div>
     <div class="hint" id="hint">Enter to send · Shift+Enter for a new line · 📎 or drag/paste to attach</div>
@@ -288,7 +300,7 @@
   <aside id="tutorsPanel" class="flyout hidden" aria-label="Language tutors">
     <div class="drawerHead"><span>🎓 Tutors</span><button class="btn" id="tutorsClose" title="Close">✕</button></div>
     <div class="drawerBody">
-      <section><h4>Language tutor</h4><div id="cfgTeachers"></div><div class="cfgempty">Pick a language, then use 🎤 dictation or 〰️ live voice for a spoken lesson (or just type). The tutor speaks &amp; understands that language.</div></section>
+      <section><h4>Language tutor</h4><div id="cfgTeachers"></div><div class="cfgempty">Pick a language, then use 🎤 dictation or the live-voice button for a spoken lesson (or just type). The tutor speaks &amp; understands that language.</div></section>
     </div>
   </aside>
   <div id="cfgScrim" class="flyoutScrim hidden"></div>
@@ -1140,9 +1152,9 @@ async function startDictation(){
     dictRec = null; dictStream = null;
     if (blob.size < 1600) { $("micbtn").classList.remove("hot"); return; }
     $("micbtn").classList.remove("hot");
-    const prev = $("micbtn").textContent; $("micbtn").textContent = "…";
+    const ico = $("micbtn").querySelector(".ico"); const prev = ico.textContent; ico.textContent = "…";
     const text = await transcribeBlob(blob, currentTeacher?.code);
-    $("micbtn").textContent = prev;
+    ico.textContent = prev;
     if (text) {
       const inp = $("input");
       inp.value = (inp.value ? inp.value.replace(/\s+$/, "") + " " : "") + text;
