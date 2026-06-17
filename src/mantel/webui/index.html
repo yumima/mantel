@@ -55,6 +55,10 @@
   .content ul,.content ol { margin: 0 0 10px; padding-left: 22px; } .content li { margin: 2px 0; }
   .content blockquote { margin: 0 0 10px; padding: 2px 12px; border-left: 3px solid var(--border); color: var(--text-dim); }
   .content a { color: var(--accent); }
+  .content table.md { border-collapse: collapse; margin: 0 0 12px; font-size: .94em; display: block; overflow-x: auto; max-width: 100%; }
+  .content table.md th, .content table.md td { border: 1px solid var(--border); padding: 5px 10px; text-align: left; vertical-align: top; }
+  .content table.md th { background: var(--bg-elev); font-weight: 650; }
+  .content table.md tbody tr:nth-child(even) { background: rgba(255,255,255,.025); }
   .content code.inline { background: var(--code-bg); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; font-size: .9em; font-family: "SFMono-Regular", Consolas, monospace; }
   .codewrap { position: relative; margin: 0 0 12px; }
   .codewrap pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; overflow-x: auto; margin: 0; }
@@ -71,6 +75,15 @@
   .tool code { color: var(--accent); background: none; font-size: 12px; }
   .tool .ok { color: var(--ok); } .tool .no { color: var(--err); }
   .tool.note { font-style: italic; }
+  .tool .args { color: var(--text-dim); font-family: "SFMono-Regular", Consolas, monospace; font-size: 11.5px; opacity: .85; }
+  .tool .res { cursor: pointer; }
+  .tool .res.expandable:hover { color: var(--text); }
+  .tool .res .more { color: var(--accent); font-size: 11px; margin-left: 4px; }
+  .tool .resfull { display: block; margin-top: 6px; white-space: pre-wrap; word-break: break-word;
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+    font-family: "SFMono-Regular", Consolas, monospace; font-size: 11.5px; color: var(--text);
+    max-height: 320px; overflow: auto; }
+  .tool .resfull.hidden { display: none; }
   .tool .genimg { display: block; max-width: 360px; max-height: 360px; border-radius: 8px; margin-top: 8px; border: 1px solid var(--border); }
   .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
@@ -303,6 +316,12 @@ let controller = null;
 let streaming = false;
 let attachments = [];   // pending: {kind:"image", url, name} | {kind:"doc", name, text, chars}
 let currentConvId = null;   // id of the conversation being persisted (null = unsaved/new)
+let trimNoteShown = false;  // have we already told the user that context was trimmed?
+// Rough context budget for what we re-send each turn (the full history still
+// persists). ~char-per-token ≈ 4, so this keeps the prompt comfortably under a
+// typical local model window while always retaining recent turns.
+const CTX_CHAR_BUDGET = 48000;   // ≈ 12k tokens
+const CTX_MIN_TURNS = 4;         // always keep at least the last few messages
 let currentTeacher = null;  // active language-tutor persona (null = normal chat)
 // Language tutors: code = whisper language hint, voice = piper voice id, prompt = persona.
 const TEACHERS = [
@@ -323,6 +342,40 @@ function inlineMd(s){
   s = s.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
   return s;
 }
+// A GitHub-style table cell row: "| a | b |" → ["a","b"] (leading/trailing pipes
+// optional). Escaped pipes (\|) are kept literal.
+function _tableCells(line){
+  const t = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  const cells = []; let cur = "";
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] === "\\" && t[i + 1] === "|") { cur += "|"; i++; }
+    else if (t[i] === "|") { cells.push(cur); cur = ""; }
+    else cur += t[i];
+  }
+  cells.push(cur);
+  return cells.map(c => c.trim());
+}
+// A separator row: each cell is dashes with optional leading/trailing colons
+// (alignment). Returns per-column align, or null if not a separator.
+function _tableAlign(line){
+  if (!/\|/.test(line) || !/-/.test(line)) return null;
+  const cells = _tableCells(line);
+  const al = [];
+  for (const c of cells) {
+    if (!/^:?-+:?$/.test(c)) return null;
+    al.push(c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : c.startsWith(":") ? "left" : "");
+  }
+  return al;
+}
+function _renderTable(header, align, rows){
+  const cell = (tag, txt, i) => {
+    const a = align[i] ? ` style="text-align:${align[i]}"` : "";
+    return `<${tag}${a}>${inlineMd(escapeHtml(txt))}</${tag}>`;
+  };
+  const head = "<tr>" + header.map((h, i) => cell("th", h, i)).join("") + "</tr>";
+  const body = rows.map(r => "<tr>" + header.map((_, i) => cell("td", r[i] != null ? r[i] : "", i)).join("") + "</tr>").join("");
+  return `<table class="md"><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
 function renderMarkdown(src){
   const out = [];
   for (const part of src.split(/(```[\s\S]*?```)/g)) {
@@ -332,16 +385,59 @@ function renderMarkdown(src){
       out.push(`<div class="codewrap"><button class="btn copy">copy</button><pre><code>${code}</code></pre></div>`);
       continue;
     }
-    let para = [], list = null;
+    let para = [];
+    // List state is a stack of {tag, indent, items} so nested bullets/numbers
+    // render as nested <ul>/<ol>. Each item may carry nested-list HTML appended
+    // after its text. `cur` items collect raw HTML strings.
+    let listStack = [];
     const flushPara = () => { if (para.length) { out.push(`<p>${inlineMd(escapeHtml(para.join(" ")))}</p>`); para = []; } };
-    const flushList = () => { if (list) { out.push(`<${list.tag}>${list.items.join("")}</${list.tag}>`); list = null; } };
-    for (const raw of part.split("\n")) {
+    const closeListsTo = (indent) => {
+      // pop list levels deeper than `indent`, nesting popped HTML into the parent item
+      while (listStack.length && listStack[listStack.length - 1].indent > indent) {
+        const lvl = listStack.pop();
+        const html = `<${lvl.tag}>${lvl.items.join("")}</${lvl.tag}>`;
+        if (listStack.length) {
+          const parent = listStack[listStack.length - 1];
+          parent.items[parent.items.length - 1] = parent.items[parent.items.length - 1].replace(/<\/li>$/, html + "</li>");
+        } else out.push(html);
+      }
+    };
+    const flushList = () => { closeListsTo(-1); };
+    const lines = part.split("\n");
+    for (let li = 0; li < lines.length; li++) {
+      const raw = lines[li];
       const line = raw.replace(/\s+$/, ""); let m;
       if (!line.trim()) { flushPara(); flushList(); continue; }
+      // Table: a header row (contains "|") immediately followed by a separator row.
+      if (/\|/.test(line) && li + 1 < lines.length && _tableAlign(lines[li + 1])) {
+        flushPara(); flushList();
+        const header = _tableCells(line);
+        const align = _tableAlign(lines[li + 1]);
+        const rows = []; let j = li + 2;
+        for (; j < lines.length; j++) {
+          if (!lines[j].trim() || !/\|/.test(lines[j])) break;
+          rows.push(_tableCells(lines[j]));
+        }
+        out.push(_renderTable(header, align, rows));
+        li = j - 1;
+        continue;
+      }
       if ((m = line.match(/^(#{1,3})\s+(.*)$/))) { flushPara(); flushList(); const h = m[1].length; out.push(`<h${h}>${inlineMd(escapeHtml(m[2]))}</h${h}>`); continue; }
       if ((m = line.match(/^>\s?(.*)$/))) { flushPara(); flushList(); out.push(`<blockquote>${inlineMd(escapeHtml(m[1]))}</blockquote>`); continue; }
-      if ((m = line.match(/^\s*[-*+]\s+(.*)$/))) { flushPara(); if (!list || list.tag !== "ul") { flushList(); list = { tag: "ul", items: [] }; } list.items.push(`<li>${inlineMd(escapeHtml(m[1]))}</li>`); continue; }
-      if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) { flushPara(); if (!list || list.tag !== "ol") { flushList(); list = { tag: "ol", items: [] }; } list.items.push(`<li>${inlineMd(escapeHtml(m[1]))}</li>`); continue; }
+      let lm;
+      if ((lm = line.match(/^(\s*)([-*+])\s+(.*)$/)) || (lm = line.match(/^(\s*)(\d+[.)])\s+(.*)$/))) {
+        flushPara();
+        const indent = lm[1].replace(/\t/g, "    ").length;
+        const tag = /\d/.test(lm[2]) ? "ol" : "ul";
+        const text = lm[3];
+        // close deeper levels, then open a new one if this indent starts a level
+        closeListsTo(indent);
+        let top = listStack[listStack.length - 1];
+        if (!top || indent > top.indent) { top = { tag, indent, items: [] }; listStack.push(top); }
+        else if (top.tag !== tag) { closeListsTo(indent - 1); top = { tag, indent, items: [] }; listStack.push(top); }
+        top.items.push(`<li>${inlineMd(escapeHtml(text))}</li>`);
+        continue;
+      }
       flushList(); para.push(line.trim());
     }
     flushPara(); flushList();
@@ -370,7 +466,15 @@ function renderTool(wrap, ev){
   if (!tools) { tools = document.createElement("div"); tools.className = "tools"; bubble.insertBefore(tools, bubble.querySelector(".content")); }
   if (ev.phase === "call") {
     const row = document.createElement("div"); row.className = "tool"; row.dataset.tid = ev.id || "";
-    row.innerHTML = `🔧 <code>${escapeHtml(ev.name || "")}</code><span class="tr"> · running…</span>`;
+    // Show the call arguments (compact JSON, truncated) so the call is transparent.
+    let argStr = "";
+    if (ev.arguments && typeof ev.arguments === "object" && Object.keys(ev.arguments).length) {
+      try { argStr = JSON.stringify(ev.arguments); } catch { argStr = ""; }
+      if (argStr.length > 120) argStr = argStr.slice(0, 120) + "…";
+    }
+    row.innerHTML = `🔧 <code>${escapeHtml(ev.name || "")}</code>`
+      + (argStr ? ` <span class="args" title="call arguments">${escapeHtml(argStr)}</span>` : "")
+      + `<span class="tr"> · running…</span>`;
     tools.appendChild(row);
   } else if (ev.phase === "result") {
     const row = [...tools.querySelectorAll(".tool[data-tid]")].reverse().find(r => r.dataset.tid === (ev.id || "")) || tools.lastElementChild;
@@ -382,15 +486,35 @@ function renderTool(wrap, ev){
         row.querySelector(".tr").innerHTML = ` <span class="ok">${icon}</span> image`;
         const el = document.createElement("img"); el.className = "genimg"; el.src = img[0]; row.appendChild(el);
       } else {
-        const snip = content.replace(/\s+/g, " ").slice(0, 140);
-        row.querySelector(".tr").innerHTML = ` <span class="${ev.ok ? "ok" : "no"}">${icon}</span> ${escapeHtml(snip)}`;
+        const oneLine = content.replace(/\s+/g, " ").trim();
+        const snip = oneLine.slice(0, 140);
+        const truncated = oneLine.length > 140 || content.length > snip.length;
+        const cls = ev.ok ? "ok" : "no";
+        const tr = row.querySelector(".tr");
+        tr.innerHTML = ` <span class="${cls}">${icon}</span> `
+          + `<span class="res${truncated ? " expandable" : ""}">${escapeHtml(snip)}`
+          + (truncated ? ` <span class="more">show all</span>` : "") + `</span>`;
+        if (truncated) {
+          // Click the result snippet → toggle the full (un-truncated) content.
+          const full = document.createElement("span"); full.className = "resfull hidden"; full.textContent = content;
+          row.appendChild(full);
+          const resEl = tr.querySelector(".res"), moreEl = tr.querySelector(".more");
+          resEl.addEventListener("click", () => {
+            const hidden = full.classList.toggle("hidden");
+            if (moreEl) moreEl.textContent = hidden ? "show all" : "show less";
+          });
+        }
       }
     }
   } else if (ev.phase === "note") {
     const row = document.createElement("div"); row.className = "tool note"; row.textContent = ev.content || ""; tools.appendChild(row);
   }
 }
-function scrollDown(){ const m = document.querySelector("main"); m.scrollTop = m.scrollHeight; }
+// Auto-scroll, but only if the user is already near the bottom — if they've
+// scrolled up to read, don't yank them back down on every streamed paint.
+// `force` overrides (e.g. after a fresh user send, or loading a conversation).
+function nearBottom(m){ return m.scrollHeight - m.scrollTop - m.clientHeight < 120; }
+function scrollDown(force){ const m = document.querySelector("main"); if (force || nearBottom(m)) m.scrollTop = m.scrollHeight; }
 document.addEventListener("click", (e) => {
   if (e.target.classList.contains("copy")) {
     const code = e.target.parentElement.querySelector("code");
@@ -446,7 +570,7 @@ async function handleSlash(text){
   const parts = text.slice(1).trim().split(/\s+/);
   const cmd = (parts.shift() || "").toLowerCase();
   const arg = parts.join(" ");
-  const sys = (html) => { addBubble("system").querySelector(".content").innerHTML = html; scrollDown(); };
+  const sys = (html) => { addBubble("system").querySelector(".content").innerHTML = html; scrollDown(true); };
   try {
     if (cmd === "" || cmd === "help") return sys(SLASH_HELP);
     if (cmd === "clear" || cmd === "new") { history = []; currentConvId = null; $("thread").innerHTML = ""; setEmpty(true); return; }
@@ -600,7 +724,7 @@ $("attachBar").addEventListener("click", (e) => {
 function _readDataURL(file){
   return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); });
 }
-function sysMsg(html){ addBubble("system").querySelector(".content").innerHTML = html; scrollDown(); }
+function sysMsg(html){ addBubble("system").querySelector(".content").innerHTML = html; scrollDown(true); }
 async function addFiles(files){
   for (const file of files) {
     if (!file) continue;
@@ -709,6 +833,32 @@ function chatTitle(hist){
   t = (t || "New chat").replace(/\s+/g, " ").trim();
   return t.length > 60 ? t.slice(0, 60) + "…" : t;
 }
+// Trim the re-sent history to a char budget, keeping the most recent turns (and
+// always at least CTX_MIN_TURNS). The full `history` array is untouched — this
+// only affects what we send to the backend this turn. Returns
+// {messages, trimmed}.
+function _msgChars(m){
+  const c = m && m.content;
+  if (typeof c === "string") return c.length;
+  if (Array.isArray(c)) return c.reduce((n, p) => n + (p && p.type === "text" ? (p.text || "").length : (p && p.type === "image_url" ? 1200 : 0)), 0);
+  return 0;
+}
+function trimForContext(hist){
+  if (hist.length <= CTX_MIN_TURNS) return { messages: hist, trimmed: false };
+  let budget = CTX_CHAR_BUDGET, start = hist.length;
+  // Walk backwards, keeping messages until the budget runs out (but never fewer
+  // than CTX_MIN_TURNS).
+  for (let i = hist.length - 1; i >= 0; i--) {
+    budget -= _msgChars(hist[i]);
+    if (budget < 0 && (hist.length - i) > CTX_MIN_TURNS) break;
+    start = i;
+  }
+  // Don't begin a slice on an orphaned assistant/tool reply — start on a user turn
+  // so the model sees coherent turns.
+  while (start < hist.length && hist[start].role !== "user") start++;
+  if (start <= 0) return { messages: hist, trimmed: false };
+  return { messages: hist.slice(start), trimmed: true };
+}
 async function saveChat(){
   if (!currentConvId || !history.length) return;
   try { await fetch(`/api/chats/${currentConvId}`, { method: "PUT", headers: { "Content-Type": "application/json" },
@@ -736,7 +886,7 @@ function renderHistory(){
     }
   }
   setEmpty(history.length === 0);
-  scrollDown();
+  scrollDown(true);
 }
 
 async function send(){
@@ -745,7 +895,7 @@ async function send(){
   const text = $("input").value.trim(); if (!text && !attachments.length) return;
   if (!attachments.length && looksLikeCommand(text)) {   // a real command — not arbitrary text starting with "/"
     $("input").value = ""; autogrow();
-    addBubble("user").querySelector(".content").textContent = text; scrollDown();
+    addBubble("user").querySelector(".content").textContent = text; scrollDown(true);
     handleSlash(text);
     return;
   }
@@ -786,13 +936,20 @@ async function _streamTurn(userContent, displayText, atts){
   if (!currentConvId) currentConvId = _uuid();
   const convId0 = currentConvId;   // pin this turn to its conversation
   history.push({ role: "user", content: userContent });
-  renderUserBubble(addBubble("user"), displayText, atts); scrollDown();
+  renderUserBubble(addBubble("user"), displayText, atts); scrollDown(true);
   const wrap = addBubble("assistant");
   let answer = "", reasoning = "", gotContent = false, err = null;
-  setContent(wrap, "", false, true); scrollDown();
+  setContent(wrap, "", false, true); scrollDown(true);
   // Inject the active tutor persona as a system message (per-request, not stored
-  // in history, so it always leads and can be switched freely).
-  const msgs = currentTeacher ? [{ role: "system", content: currentTeacher.prompt }, ...history] : history;
+  // in history, so it always leads and can be switched freely). Trim older turns
+  // so a long conversation never overruns the model's context window.
+  const sent = trimForContext(history);
+  if (sent.trimmed && !trimNoteShown) { trimNoteShown = true;
+    addBubble("system").querySelector(".content").innerHTML =
+      `<span style="color:var(--text-dim)">✂ Earlier messages trimmed to fit the model's context — full history is still saved.</span>`;
+  }
+  if (!sent.trimmed) trimNoteShown = false;   // re-arm the note if history shrinks (e.g. new chat)
+  const msgs = currentTeacher ? [{ role: "system", content: currentTeacher.prompt }, ...sent.messages] : sent.messages;
   // Deep-think off → hearth's `think:false` fast lane (a no-op on non-hearth backends).
   const req = deepThink ? { model, messages: msgs, stream: true }
                         : { model, messages: msgs, stream: true, think: false };

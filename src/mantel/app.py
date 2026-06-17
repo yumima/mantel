@@ -15,6 +15,7 @@ configured the loop runs once → it's a plain streaming chat.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import io
 import json
 import os
@@ -136,19 +137,49 @@ def _extract_text(name: str, data: bytes) -> str:
         f"unsupported document type '{ext}' — attach an image, PDF, DOCX, or text file")
 
 
-def _chats_db() -> sqlite3.Connection:
-    """SQLite store for persisted conversations (~/.local/share/mantel/chats.db)."""
+_CHATS_SCHEMA_VERSION = 1
+
+
+def _open_chats_db() -> sqlite3.Connection:
+    """Open the SQLite store (~/.local/share/mantel/chats.db) and ensure its schema
+    exists. Called ONCE (at startup, or lazily on first use under tests that skip
+    the lifespan); the connection is then kept on ``app.state`` and reused.
+
+    ``check_same_thread=False`` so the single connection can be used from the
+    ``asyncio.to_thread`` worker pool — writes are serialized with a lock to keep
+    that safe (sqlite connections aren't concurrency-safe across threads)."""
     base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
     d = Path(base) / "mantel"
     d.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(d / "chats.db", timeout=10.0)
+    con = sqlite3.connect(d / "chats.db", timeout=10.0, check_same_thread=False)
     con.execute("PRAGMA busy_timeout=5000")
+    con.execute("PRAGMA journal_mode=WAL")  # better concurrent read/write behavior
     con.execute("CREATE TABLE IF NOT EXISTS conversations("
                 "id TEXT PRIMARY KEY, title TEXT, created REAL, updated REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS messages("
                 "conv_id TEXT, seq INTEGER, role TEXT, content TEXT)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id)")
+    con.execute(f"PRAGMA user_version={_CHATS_SCHEMA_VERSION}")  # for future migrations
+    con.commit()
     return con
+
+
+async def _shutdown_shared(app: FastAPI) -> None:
+    """Close the pooled HTTP client and the chats DB connection on shutdown."""
+    client = getattr(app.state, "http", None)
+    if client is not None:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        app.state.http = None
+    con = getattr(app.state, "chats_db", None)
+    if con is not None:
+        try:
+            con.close()
+        except Exception:
+            pass
+        app.state.chats_db = None
 
 
 def _has_image(messages: list) -> bool:
@@ -170,11 +201,23 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.cfg = cfg
+        # Pool ONE httpx client for all backend calls (models polling every ~5s,
+        # chat turns, STT/TTS) — reuses TCP connections instead of a handshake per
+        # call. Closed on shutdown.
+        app.state.http = httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+        )
+        # Open the chats DB ONCE (schema created here, not per request).
+        app.state.chats_db = _open_chats_db()
         if external_host:
             # Tests inject a pre-started host and manage its lifecycle themselves.
             app.state.host = host
             app.state.reload = None
-            yield
+            try:
+                yield
+            finally:
+                await _shutdown_shared(app)
             return
 
         # The host's MCP sessions must be started, reloaded, and stopped in ONE
@@ -227,11 +270,36 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
                 await asyncio.wait_for(task, timeout=10.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 task.cancel()
+            await _shutdown_shared(app)
 
     app = FastAPI(title="mantel", version="0.2.0", lifespan=lifespan)
     app.add_middleware(_LocalGuard)
     app.state.cfg = cfg
     app.state.host = None
+    # Shared resources are created in the lifespan; default to None so the lazy
+    # accessors below can fill them in on first use under tests that skip it.
+    app.state.http = None
+    app.state.chats_db = None
+    app.state.db_lock = asyncio.Lock()
+
+    def _http() -> httpx.AsyncClient:
+        """The pooled client (lifespan), or a lazily-created one for tests that
+        don't run the lifespan. Cached on app.state either way."""
+        c = app.state.http
+        if c is None:
+            c = app.state.http = httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=10.0),
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+            )
+        return c
+
+    def _db() -> sqlite3.Connection:
+        """The single chats connection (lifespan), or a lazily-opened one for tests
+        that skip the lifespan. Cached on app.state — schema is created once."""
+        con = app.state.chats_db
+        if con is None:
+            con = app.state.chats_db = _open_chats_db()
+        return con
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def index() -> HTMLResponse:
@@ -303,8 +371,7 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
     async def api_models() -> JSONResponse:
         prov = app.state.cfg.active()
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.get(f"{prov.base_url}/models", headers=prov.headers())
+            r = await _http().get(f"{prov.base_url}/models", headers=prov.headers(), timeout=10.0)
             return JSONResponse(r.json(), status_code=r.status_code)
         except (httpx.HTTPError, ValueError) as e:
             return JSONResponse({"error": str(e), "data": []}, status_code=502)
@@ -312,28 +379,35 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
     # ── conversation persistence ─────────────────────────────────────────────
     @app.get("/api/chats")
     async def list_chats() -> JSONResponse:
-        con = _chats_db()
-        try:
-            rows = con.execute(
+        con = _db()
+
+        def _read():
+            return con.execute(
                 "SELECT c.id, c.title, c.updated, "
                 "(SELECT count(*) FROM messages m WHERE m.conv_id = c.id) "
                 "FROM conversations c ORDER BY c.updated DESC").fetchall()
-        finally:
-            con.close()
+
+        async with app.state.db_lock:
+            rows = await asyncio.to_thread(_read)
         return JSONResponse({"chats": [
             {"id": r[0], "title": r[1], "updated": r[2], "messages": r[3]} for r in rows]})
 
     @app.get("/api/chats/{cid}")
     async def get_chat(cid: str) -> JSONResponse:
-        con = _chats_db()
-        try:
+        con = _db()
+
+        def _read():
             c = con.execute("SELECT id, title FROM conversations WHERE id=?", (cid,)).fetchone()
             if not c:
-                return JSONResponse({"error": "not found"}, status_code=404)
+                return None, []
             msgs = con.execute(
                 "SELECT role, content FROM messages WHERE conv_id=? ORDER BY seq", (cid,)).fetchall()
-        finally:
-            con.close()
+            return c, msgs
+
+        async with app.state.db_lock:
+            c, msgs = await asyncio.to_thread(_read)
+        if not c:
+            return JSONResponse({"error": "not found"}, status_code=404)
         out = []
         for role, content in msgs:
             try:
@@ -348,9 +422,12 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
         body = await request.json()
         title = (body.get("title") or "Untitled")[:120]
         messages = body.get("messages") or []
+        if not isinstance(messages, list):
+            messages = []
         now = time.time()
-        con = _chats_db()
-        try:
+        con = _db()
+
+        def _write():
             exists = con.execute("SELECT 1 FROM conversations WHERE id=?", (cid,)).fetchone()
             if exists:
                 con.execute("UPDATE conversations SET title=?, updated=? WHERE id=?", (title, now, cid))
@@ -358,26 +435,27 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
                 con.execute("INSERT INTO conversations(id,title,created,updated) VALUES(?,?,?,?)",
                             (cid, title, now, now))
             con.execute("DELETE FROM messages WHERE conv_id=?", (cid,))
-            if not isinstance(messages, list):
-                messages = []
             con.executemany(
                 "INSERT INTO messages(conv_id,seq,role,content) VALUES(?,?,?,?)",
                 [(cid, i, m.get("role", ""), json.dumps(m.get("content")))
                  for i, m in enumerate(messages) if isinstance(m, dict)])
             con.commit()
-        finally:
-            con.close()
+
+        async with app.state.db_lock:
+            await asyncio.to_thread(_write)
         return JSONResponse({"ok": True, "id": cid, "title": title})
 
     @app.delete("/api/chats/{cid}")
     async def delete_chat(cid: str) -> JSONResponse:
-        con = _chats_db()
-        try:
+        con = _db()
+
+        def _write():
             con.execute("DELETE FROM conversations WHERE id=?", (cid,))
             con.execute("DELETE FROM messages WHERE conv_id=?", (cid,))
             con.commit()
-        finally:
-            con.close()
+
+        async with app.state.db_lock:
+            await asyncio.to_thread(_write)
         return JSONResponse({"ok": True})
 
     @app.post("/api/extract")
@@ -391,7 +469,9 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
         if len(data) > _MAX_DOC_BYTES:
             return JSONResponse({"error": "file too large (max 25 MB)"}, status_code=413)
         try:
-            text = _extract_text(file.filename or "file", data)
+            # PDF/DOCX parsing is CPU-bound and can stall the event loop on a big
+            # upload — run it off the loop.
+            text = await asyncio.to_thread(_extract_text, file.filename or "file", data)
         except _ExtractError as e:
             return JSONResponse({"error": str(e)}, status_code=415)
         except Exception as e:  # never 500 on a malformed upload
@@ -414,9 +494,8 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
         if language.strip():
             form["language"] = language.strip()
         try:
-            async with httpx.AsyncClient(timeout=180.0) as client:
-                r = await client.post(f"{prov.base_url}/audio/transcriptions",
-                                      files=files, data=form, headers=prov.headers())
+            r = await _http().post(f"{prov.base_url}/audio/transcriptions",
+                                    files=files, data=form, headers=prov.headers(), timeout=180.0)
         except httpx.HTTPError as e:
             return JSONResponse({"error": f"STT backend unreachable: {e}"}, status_code=502)
         if r.status_code != 200:
@@ -441,8 +520,8 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
         if voice:
             req["voice"] = voice
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                r = await client.post(f"{prov.base_url}/audio/speech", json=req, headers=prov.headers())
+            r = await _http().post(f"{prov.base_url}/audio/speech", json=req,
+                                   headers=prov.headers(), timeout=120.0)
         except httpx.HTTPError as e:
             return JSONResponse({"error": f"TTS backend unreachable: {e}"}, status_code=502)
         if r.status_code != 200:
@@ -479,8 +558,13 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
                         req["tools"] = tools
                     content = ""
                     tcs: dict[int, dict] = {}
+                    # Pass the pooled client to the real streamer; a monkeypatched
+                    # test fake takes only (prov, req), so detect & adapt.
+                    stream = (_backend_chat_stream(prov, req, _http())
+                              if _accepts_client(_backend_chat_stream)
+                              else _backend_chat_stream(prov, req))
                     try:
-                        async for payload in _backend_chat_stream(prov, req):
+                        async for payload in stream:
                             try:
                                 obj = json.loads(payload)
                             except ValueError:
@@ -545,13 +629,28 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
 # ── backend streaming (isolated so tests can fake the backend) ────────────────
 
 
-async def _backend_chat_stream(prov: cfgmod.Provider, req: dict):
+def _accepts_client(fn) -> bool:
+    """True if ``fn`` declares a ``client`` parameter — lets the chat loop hand the
+    pooled client to the real streamer while tolerating a 2-arg monkeypatched fake."""
+    try:
+        return "client" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+async def _backend_chat_stream(prov: cfgmod.Provider, req: dict, client: httpx.AsyncClient | None = None):
     """Yield each backend SSE ``data:`` payload (prefix stripped, ``[DONE]``
-    excluded). Raises ``_BackendError`` on a non-200 response."""
+    excluded). Raises ``_BackendError`` on a non-200 response.
+
+    ``client`` is the pooled :class:`httpx.AsyncClient` from app.state; if omitted
+    (e.g. a direct/test call) a throwaway client is created for this stream."""
     headers = {"Content-Type": "application/json", **prov.headers()}
-    async with httpx.AsyncClient(timeout=None) as client:
+    own = client is None
+    if own:
+        client = httpx.AsyncClient(timeout=None)
+    try:
         async with client.stream("POST", f"{prov.base_url}/chat/completions",
-                                 json=req, headers=headers) as r:
+                                 json=req, headers=headers, timeout=None) as r:
             if r.status_code != 200:
                 detail = (await r.aread()).decode("utf-8", "ignore")[:300]
                 raise _BackendError(f"backend {r.status_code}: {detail}")
@@ -562,6 +661,9 @@ async def _backend_chat_stream(prov: cfgmod.Provider, req: dict):
                 if payload == "[DONE]":
                     return
                 yield payload
+    finally:
+        if own:
+            await client.aclose()
 
 
 # ── SSE frame builders + streamed-tool-call accumulation ──────────────────────
