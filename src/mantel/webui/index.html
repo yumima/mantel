@@ -101,11 +101,6 @@
   #attach { flex: 0 0 auto; width: 32px; height: 36px; background: transparent; border: 0; cursor: pointer;
     color: var(--text-dim); font-size: 17px; display: grid; place-items: center; padding: 0; }
   #attach:hover { color: var(--accent); }
-  #voicebtn { flex: 0 0 auto; width: 32px; height: 36px; background: transparent; border: 0; cursor: pointer;
-    color: var(--text-dim); font-size: 17px; display: grid; place-items: center; padding: 0; }
-  #voicebtn:hover { color: var(--accent); }
-  #voicebtn.on { color: var(--ok); }
-  #voicebtn.hot { color: var(--err); animation: blink 0.9s steps(2) infinite; }   /* mic is recording */
   /* activity indicator (listening / transcribing / thinking / speaking) */
   .activity { max-width: var(--maxw); margin: 0 auto 8px; display: flex; align-items: center; gap: 8px;
     font-size: 13px; color: var(--text); }
@@ -159,25 +154,92 @@
     box-shadow: 14px 0 44px rgba(0,0,0,.45); }
   .row.active { border-color: var(--accent-dim); }
   .row .lbl { cursor: pointer; }
+
+  /* ── persistent left icon rail (Claude/Gemini style) ───────────────────────── */
+  :root { --rail: 56px; }
+  body { flex-direction: row; }                       /* rail | app-column */
+  #rail { flex: 0 0 var(--rail); width: var(--rail); background: var(--bg-elev);
+    border-right: 1px solid var(--border); display: flex; flex-direction: column; align-items: center;
+    padding: 10px 0; gap: 4px; z-index: 60; }
+  #rail .railmark { width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center;
+    margin-bottom: 8px; flex: 0 0 auto; }
+  #rail .railmark svg { width: 20px; height: 20px; }
+  .railbtn { position: relative; width: 40px; height: 40px; border-radius: 10px; border: 0;
+    background: transparent; color: var(--text-dim); font-size: 19px; cursor: pointer;
+    display: grid; place-items: center; flex: 0 0 auto; }
+  .railbtn:hover { background: var(--bg-input); color: var(--text); }
+  .railbtn.active { background: var(--user-bg); color: var(--accent); }
+  .railbtn .tip { position: absolute; left: calc(100% + 10px); top: 50%; transform: translateY(-50%) translateX(-6px);
+    background: var(--bg-input); color: var(--text); border: 1px solid var(--border); border-radius: 7px;
+    padding: 4px 9px; font-size: 12px; white-space: nowrap; pointer-events: none; opacity: 0;
+    box-shadow: 0 6px 20px rgba(0,0,0,.4); transition: opacity .12s, transform .12s; z-index: 70; }
+  .railbtn:hover .tip { opacity: 1; transform: translateY(-50%) translateX(0); }
+  #rail .railspacer { flex: 1 1 auto; }
+  #rail .raildot { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px 0 2px;
+    color: var(--text-dim); font-size: 9px; }
+  /* app column to the right of the rail */
+  #app { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; height: 100%; }
+
+  /* flyout panels anchored next to the rail (not centered modals) */
+  .flyout { position: fixed; top: 0; left: var(--rail); bottom: 0; width: 340px; max-width: calc(100vw - var(--rail));
+    z-index: 55; background: var(--bg-elev); border-right: 1px solid var(--border); display: flex; flex-direction: column;
+    box-shadow: 14px 0 44px rgba(0,0,0,.45); }
+  .flyout.hidden { display: none; }
+  .flyoutScrim { position: fixed; inset: 0 0 0 var(--rail); background: rgba(0,0,0,.35); z-index: 54; }
+  .flyoutScrim.hidden { display: none; }
+
+  /* composer controls row (Claude-style rounded container) */
+  .composer { flex-wrap: wrap; }
+  .compInput { display: flex; align-items: flex-end; gap: 8px; width: 100%; }
+  .compRow { display: flex; align-items: center; gap: 6px; width: 100%; padding: 2px 2px 0; }
+  .compRow .grow { flex: 1 1 auto; }
+  #model.compsel { background: transparent; border: 1px solid var(--border); border-radius: 8px;
+    padding: 4px 8px; font-size: 12px; color: var(--text-dim); max-width: 200px; }
+  #model.compsel:hover { color: var(--text); border-color: #4a4b55; }
+  #think.compthink { padding: 4px 9px; font-size: 12px; }
+  .compRow .cbtn { width: 30px; height: 30px; background: transparent; border: 0; cursor: pointer;
+    color: var(--text-dim); font-size: 16px; display: grid; place-items: center; padding: 0; border-radius: 8px; }
+  .compRow .cbtn:hover { color: var(--accent); background: var(--bg-elev); }
+  #micbtn.hot { color: var(--err); animation: blink 0.9s steps(2) infinite; }
+  #wavebtn.on { color: var(--ok); }
+
+  /* live-voice overlay */
+  #live { position: fixed; inset: 0 0 0 var(--rail); z-index: 80; background: rgba(15,16,20,.96);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 28px; }
+  #live.hidden { display: none; }
+  #live .who { font-size: 14px; color: var(--text-dim); letter-spacing: .3px; }
+  #live .status { font-size: 16px; color: var(--text); }
+  .orb { position: relative; width: 150px; height: 150px; border-radius: 50%;
+    background: radial-gradient(circle at 50% 45%, var(--accent), var(--accent-dim) 70%);
+    box-shadow: 0 0 50px -6px var(--accent-dim); display: grid; place-items: center; }
+  .orb::before, .orb::after { content: ""; position: absolute; inset: 0; border-radius: 50%;
+    border: 2px solid var(--accent); opacity: .5; animation: pulse 2.4s ease-out infinite; }
+  .orb::after { animation-delay: 1.2s; }
+  .orb.listen { animation: orbpulse 1.1s ease-in-out infinite; }
+  .orb.work::before, .orb.work::after { animation-duration: 1.2s; }
+  @keyframes pulse { 0% { transform: scale(1); opacity: .5; } 100% { transform: scale(1.7); opacity: 0; } }
+  @keyframes orbpulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.08); } }
+  #live .stop { background: var(--err); color: #fff; border: 0; border-radius: 30px; padding: 12px 30px;
+    font-size: 15px; font-weight: 600; cursor: pointer; }
+  #live .stop:hover { filter: brightness(1.1); }
 </style>
 </head>
 <body>
-  <header>
-    <span class="brand">
-      <svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="5" width="20" height="3" rx="1.5" fill="#6ea8fe"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9" fill="none" stroke="#6ea8fe" stroke-width="2"/></svg>
-      Mantel
+  <nav id="rail" aria-label="Mantel navigation">
+    <span class="railmark" title="Mantel" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="3" rx="1.5" fill="#6ea8fe"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9" fill="none" stroke="#6ea8fe" stroke-width="2"/></svg>
     </span>
-    <button class="btn" id="chatsbtn" title="Conversations">Chats</button>
-    <span class="spacer"></span>
-    <select id="model" title="Model"></select>
-    <select id="partner" title="Voice/chat partner — Assistant or a language tutor"></select>
-    <button class="toggle" id="think" title="Fast by default. Click for deep-think: the model reasons before answering (better for hard questions, but slower).">⚡ Fast</button>
-    <span class="status"><span class="dot" id="dot"></span><span id="statusText">…</span></span>
-    <button class="btn" id="cfgbtn" title="Tools &amp; settings">⚙</button>
-    <button class="btn" id="newchat" title="New conversation">New</button>
-  </header>
+    <button class="railbtn" id="newchat" title="New chat" aria-label="New chat">＋<span class="tip">New chat</span></button>
+    <button class="railbtn" id="chatsbtn" title="Conversations" aria-label="Conversations">🕘<span class="tip">Conversations</span></button>
+    <button class="railbtn" id="tutorsbtn" title="Tutors" aria-label="Language tutors">🎓<span class="tip">Tutors</span></button>
+    <button class="railbtn" id="toolsbtn" title="Tools &amp; MCP" aria-label="Tools and MCP">🔧<span class="tip">Tools &amp; MCP</span></button>
+    <button class="railbtn" id="cfgbtn" title="Settings" aria-label="Settings">⚙<span class="tip">Settings</span></button>
+    <span class="railspacer"></span>
+    <span class="raildot" aria-live="polite"><span class="dot" id="dot"></span><span id="statusText">…</span></span>
+  </nav>
+  <div id="app">
   <main>
-    <div id="thread"></div>
+    <div id="thread" aria-live="polite"></div>
     <div id="empty"><div class="big">Mantel</div><div id="emptySub">Universal chat — local-first, any backend.</div></div>
   </main>
   <footer>
@@ -185,30 +247,52 @@
     <div id="attachBar" class="attachbar hidden"></div>
     <div class="composer">
       <div id="palette" class="palette hidden"></div>
-      <button id="attach" title="Attach image or document">📎</button>
       <input type="file" id="file" multiple hidden
              accept="image/*,.pdf,.docx,.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.log,.py,.js,.ts,.tsx,.html,.css,.sh,.c,.cpp,.h,.rs,.go,.java,.rb,.toml,.ini,.xml,.sql">
-      <button id="voicebtn" title="Voice conversation — click to talk, click again to stop">🎤</button>
-      <textarea id="input" rows="1" placeholder="Message…   ( type / for commands )" autofocus></textarea>
-      <button id="send" title="Send">↑</button>
+      <div class="compInput">
+        <button id="attach" title="Attach image or document" aria-label="Attach">📎</button>
+        <textarea id="input" rows="1" placeholder="Message…   ( type / for commands )" autofocus></textarea>
+        <button id="send" title="Send" aria-label="Send">↑</button>
+      </div>
+      <div class="compRow">
+        <select id="model" class="compsel" title="Model" aria-label="Model"></select>
+        <select id="partner" hidden aria-hidden="true"></select>
+        <button class="toggle compthink" id="think" title="Fast by default. Click for deep-think: the model reasons before answering (better for hard questions, but slower).">⚡ Fast</button>
+        <span class="grow"></span>
+        <button class="cbtn" id="micbtn" title="Dictate — hold to speak, click to stop; text goes into the box" aria-label="Dictate to input">🎤</button>
+        <button class="cbtn" id="wavebtn" title="Live voice conversation — hands-free" aria-label="Live voice conversation">〰️</button>
+      </div>
     </div>
     <div class="hint" id="hint">Enter to send · Shift+Enter for a new line · 📎 or drag/paste to attach</div>
   </footer>
-  <div id="chatsScrim" class="scrim hidden"></div>
-  <aside id="chatsPanel" class="drawer left hidden" aria-label="Conversations">
+  </div>
+  <div id="chatsScrim" class="flyoutScrim hidden"></div>
+  <aside id="chatsPanel" class="flyout hidden" aria-label="Conversations">
     <div class="drawerHead"><span>Conversations</span><button class="btn" id="chatsNew" title="Start a new conversation">+ New</button></div>
     <div class="drawerBody" id="chatsList"></div>
   </aside>
-  <div id="cfgScrim" class="scrim hidden"></div>
-  <aside id="cfgPanel" class="drawer hidden" aria-label="Tools and settings">
+  <div id="tutorsScrim" class="flyoutScrim hidden"></div>
+  <aside id="tutorsPanel" class="flyout hidden" aria-label="Language tutors">
+    <div class="drawerHead"><span>🎓 Tutors</span><button class="btn" id="tutorsClose" title="Close">✕</button></div>
+    <div class="drawerBody">
+      <section><h4>Language tutor</h4><div id="cfgTeachers"></div><div class="cfgempty">Pick a language, then use 🎤 dictation or 〰️ live voice for a spoken lesson (or just type). The tutor speaks &amp; understands that language.</div></section>
+    </div>
+  </aside>
+  <div id="cfgScrim" class="flyoutScrim hidden"></div>
+  <aside id="cfgPanel" class="flyout hidden" aria-label="Tools and settings">
     <div class="drawerHead"><span>⚙ Tools &amp; Settings</span><button class="btn" id="cfgClose" title="Close">✕</button></div>
     <div class="drawerBody">
-      <section><h4>Language tutor</h4><div id="cfgTeachers"></div><div class="cfgempty">Pick a language, then click 🎙️ for a spoken lesson (or just type). The tutor speaks &amp; understands that language.</div></section>
       <section><h4>Backend</h4><div id="cfgProviders"></div><div id="cfgStatus" class="cfgempty"></div></section>
       <section><h4>MCP servers</h4><div id="cfgServers"></div></section>
       <section><h4>Tools <span id="cfgToolCount" class="muted"></span></h4><div id="cfgTools"></div></section>
     </div>
   </aside>
+  <div id="live" class="hidden" role="dialog" aria-label="Live voice conversation" aria-modal="true">
+    <div class="who" id="liveWho">Assistant</div>
+    <div class="orb" id="liveOrb"></div>
+    <div class="status" id="liveStatus">starting…</div>
+    <button class="stop" id="liveStop" aria-label="Stop live voice">■ Stop</button>
+  </div>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -770,8 +854,8 @@ let voiceMode = false;
 // Prominent activity indicator + mic colour. kind: "listen" (red, mic hot) |
 // "work" (accent) | "" (hide).
 function setActivity(label, kind){
-  const mic = $("voicebtn");
-  if (mic) { mic.classList.toggle("hot", kind === "listen"); mic.classList.toggle("on", voiceMode && kind !== "listen"); }
+  const wave = $("wavebtn");
+  if (wave) wave.classList.toggle("on", voiceMode);
   const el = $("activity"); if (!el) return;
   if (!label) { el.classList.add("hidden"); el.textContent = ""; return; }
   el.className = "activity " + (kind || "work");
@@ -779,12 +863,17 @@ function setActivity(label, kind){
 }
 function voiceStatus(s){
   const who = currentTeacher ? currentTeacher.name : "Assistant";
-  const b = $("voicebtn"); if (b) b.title = voiceMode ? `Voice (${who}) — click to stop` : "Voice conversation — click to talk";
-  if (!voiceMode) { setActivity("", ""); return; }
+  // Drive the live-voice overlay (orb + status text).
+  const orb = $("liveOrb"), st = $("liveStatus"), w = $("liveWho");
+  if (w) w.textContent = who;
+  if (!voiceMode) { if (orb) orb.className = "orb"; return; }
   const t = s || "on";
   const listening = /listen|waiting/.test(t);
-  const icon = listening ? "🔴" : /transcrib/.test(t) ? "✍️" : /think/.test(t) ? "💭" : /speak/.test(t) ? "🔊" : "🎤";
-  setActivity(`${icon} ${who} · ${t}`, listening ? "listen" : "work");
+  if (orb) orb.className = "orb " + (listening ? "listen" : "work");
+  if (st) {
+    const icon = listening ? "🔴" : /transcrib/.test(t) ? "✍️" : /think/.test(t) ? "💭" : /speak/.test(t) ? "🔊" : "🎤";
+    st.textContent = `${icon} ${t}`;
+  }
 }
 function speakText(text, voice){
   return new Promise(async (resolve) => {
@@ -872,11 +961,41 @@ async function voiceLoop(){
 }
 function toggleVoiceMode(){
   voiceMode = !voiceMode;
-  $("voicebtn").classList.toggle("on", voiceMode);
+  $("wavebtn").classList.toggle("on", voiceMode);
+  $("live").classList.toggle("hidden", !voiceMode);   // full-area live-voice overlay
   if (voiceMode) { voiceStatus("starting…"); voiceLoop(); }
   else { if (ttsAudio) { try { ttsAudio.pause(); } catch {} } if (streaming) controller?.abort(); }
 }
-$("voicebtn").addEventListener("click", toggleVoiceMode);
+$("wavebtn").addEventListener("click", toggleVoiceMode);
+$("liveStop").addEventListener("click", () => { if (voiceMode) toggleVoiceMode(); });
+
+// ── push-to-talk dictation: record → /api/transcribe → fill #input (not a chat
+//    send; the user edits/sends). Distinct from the hands-free wave/live loop. ──
+let dictRec = null, dictStream = null, dictChunks = [];
+async function startDictation(){
+  try { dictStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
+  catch { sysMsg("⚠ microphone unavailable"); return; }
+  dictChunks = []; dictRec = new MediaRecorder(dictStream);
+  dictRec.ondataavailable = e => { if (e.data && e.data.size) dictChunks.push(e.data); };
+  dictRec.onstop = async () => {
+    try { dictStream.getTracks().forEach(t => t.stop()); } catch {}
+    const blob = new Blob(dictChunks, { type: dictRec.mimeType || "audio/webm" });
+    dictRec = null; dictStream = null;
+    if (blob.size < 1600) { $("micbtn").classList.remove("hot"); return; }
+    $("micbtn").classList.remove("hot");
+    const prev = $("micbtn").textContent; $("micbtn").textContent = "…";
+    const text = await transcribeBlob(blob, currentTeacher?.code);
+    $("micbtn").textContent = prev;
+    if (text) {
+      const inp = $("input");
+      inp.value = (inp.value ? inp.value.replace(/\s+$/, "") + " " : "") + text;
+      autogrow(); inp.focus();
+    }
+  };
+  dictRec.start(); $("micbtn").classList.add("hot");
+}
+function stopDictation(){ if (dictRec && dictRec.state !== "inactive") { try { dictRec.stop(); } catch {} } }
+$("micbtn").addEventListener("click", () => { if (dictRec) stopDictation(); else startDictation(); });
 
 function autogrow(){ const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 200) + "px"; }
 $("input").addEventListener("input", () => { autogrow(); updatePalette(); });
@@ -896,20 +1015,47 @@ $("think").addEventListener("click", () => { deepThink = !deepThink; $("think").
 $("newchat").addEventListener("click", () => { if (streaming) controller?.abort(); history = []; currentConvId = null; $("thread").innerHTML = ""; setEmpty(true); $("input").focus(); });
 
 // ── tools & settings drawer (clickable config — same actions as the / palette) ─
-function openCfg(){ $("cfgScrim").classList.remove("hidden"); $("cfgPanel").classList.remove("hidden"); refreshCfg(); }
-function closeCfg(){ $("cfgScrim").classList.add("hidden"); $("cfgPanel").classList.add("hidden"); }
+// Only one left flyout open at a time — opening one closes the others.
+function closeFlyouts(){ closeCfg(); closeChats(); closeTutors(); }
+function setRailActive(id){ document.querySelectorAll(".railbtn").forEach(b => b.classList.toggle("active", b.id === id)); }
+function openCfg(){ closeFlyouts(); $("cfgScrim").classList.remove("hidden"); $("cfgPanel").classList.remove("hidden"); setRailActive("cfgbtn"); refreshCfg(); }
+function closeCfg(){ $("cfgScrim").classList.add("hidden"); $("cfgPanel").classList.add("hidden"); if ($("cfgbtn").classList.contains("active")) setRailActive(""); }
 $("cfgbtn").addEventListener("click", openCfg);
 $("cfgClose").addEventListener("click", closeCfg);
 $("cfgScrim").addEventListener("click", closeCfg);
+
+function openTutors(){ closeFlyouts(); $("tutorsScrim").classList.remove("hidden"); $("tutorsPanel").classList.remove("hidden"); setRailActive("tutorsbtn"); refreshTutors(); }
+function closeTutors(){ $("tutorsScrim").classList.add("hidden"); $("tutorsPanel").classList.add("hidden"); if ($("tutorsbtn").classList.contains("active")) setRailActive(""); }
+$("tutorsbtn").addEventListener("click", openTutors);
+$("tutorsClose").addEventListener("click", closeTutors);
+$("tutorsScrim").addEventListener("click", closeTutors);
+// Tools button maps to the same Tools & Settings drawer (MCP + providers + tools).
+$("toolsbtn").addEventListener("click", openCfg);
+
+function refreshTutors(){
+  const te = $("cfgTeachers"); if (!te) return;
+  te.innerHTML = "";
+  const off = document.createElement("button");
+  off.className = "pill" + (!currentTeacher ? " on" : ""); off.textContent = "Off";
+  off.addEventListener("click", () => setTeacher(null)); te.appendChild(off);
+  for (const t of TEACHERS) {
+    const b = document.createElement("button");
+    b.className = "pill" + (currentTeacher && currentTeacher.code === t.code ? " on" : "");
+    b.textContent = t.name; b.addEventListener("click", () => setTeacher(t)); te.appendChild(b);
+  }
+}
+
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape" || palOpen()) return;
+  if (voiceMode) { toggleVoiceMode(); return; }
   if (!$("cfgPanel").classList.contains("hidden")) closeCfg();
+  else if (!$("tutorsPanel").classList.contains("hidden")) closeTutors();
   else if (!$("chatsPanel").classList.contains("hidden")) closeChats();
 });
 
 // ── conversations drawer (list / resume / delete persisted chats) ─────────────
-function openChats(){ $("chatsScrim").classList.remove("hidden"); $("chatsPanel").classList.remove("hidden"); refreshChats(); }
-function closeChats(){ $("chatsScrim").classList.add("hidden"); $("chatsPanel").classList.add("hidden"); }
+function openChats(){ closeFlyouts(); $("chatsScrim").classList.remove("hidden"); $("chatsPanel").classList.remove("hidden"); setRailActive("chatsbtn"); refreshChats(); }
+function closeChats(){ $("chatsScrim").classList.add("hidden"); $("chatsPanel").classList.add("hidden"); if ($("chatsbtn").classList.contains("active")) setRailActive(""); }
 function relTime(ts){
   if (!ts) return "";
   const s = Date.now() / 1000 - ts;
@@ -950,8 +1096,8 @@ $("chatsNew").addEventListener("click", () => { if (streaming) controller?.abort
 
 function setTeacher(t){
   currentTeacher = t;
-  const sel = $("partner"); if (sel) sel.value = t ? t.code : "";   // keep header dropdown in sync
-  if (!$("cfgPanel").classList.contains("hidden")) refreshCfg();
+  const sel = $("partner"); if (sel) sel.value = t ? t.code : "";   // keep partner state in sync
+  if (!$("tutorsPanel").classList.contains("hidden")) refreshTutors();
   if (t) {
     addBubble("system").querySelector(".content").innerHTML =
       `<span style="color:var(--text-dim)">🎓 ${escapeHtml(t.name)} tutor active — I'll speak &amp; understand ${escapeHtml(t.name)}. Click 🎙️ for a spoken lesson, or just type.</span>`;
@@ -959,19 +1105,6 @@ function setTeacher(t){
   }
 }
 async function refreshCfg(){
-  // language tutors (static list)
-  const te = $("cfgTeachers");
-  if (te) {
-    te.innerHTML = "";
-    const off = document.createElement("button");
-    off.className = "pill" + (!currentTeacher ? " on" : ""); off.textContent = "Off";
-    off.addEventListener("click", () => setTeacher(null)); te.appendChild(off);
-    for (const t of TEACHERS) {
-      const b = document.createElement("button");
-      b.className = "pill" + (currentTeacher && currentTeacher.code === t.code ? " on" : "");
-      b.textContent = t.name; b.addEventListener("click", () => setTeacher(t)); te.appendChild(b);
-    }
-  }
   try {
     const c = await (await fetch("/api/config")).json();
     $("cfgStatus").textContent = `${c.backend} · ${c.tools} tool(s)`;
