@@ -258,6 +258,13 @@
   .tutorCustomInput { flex: 1 1 auto; min-width: 0; background: var(--bg-input); color: var(--text);
     border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px; font-size: 13px; }
   .tutorCustomInput:focus { outline: none; border-color: var(--accent); }
+  .tutorProgress { margin-top: 12px; width: 100%; background: var(--bg-elev);
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+  .tutorProgress .tphead { font-size: 12px; font-weight: 650; color: var(--text);
+    margin-bottom: 6px; }
+  .tutorProgress .tprow { display: flex; justify-content: space-between; gap: 10px;
+    font-size: 12.5px; color: var(--text-dim); padding: 2px 0; }
+  .tutorProgress .tprow b { color: var(--text); font-weight: 600; text-align: right; }
   .orb { position: relative; width: 150px; height: 150px; border-radius: 50%;
     background: radial-gradient(circle at 50% 45%, var(--accent), var(--accent-dim) 70%);
     box-shadow: 0 0 50px -6px var(--accent-dim); display: grid; place-items: center; }
@@ -377,10 +384,52 @@ const TEACHERS = [
 ];
 // A typed language becomes a tutor too (auto-detect STT, English fallback TTS).
 function customTeacher(name){ return { code: "", name: name.trim(), voice: "", custom: true }; }
+
+// ── Adaptive student model (persisted per language by the backend) ───────────
+function teacherKey(t){ return t ? (t.code || t.name.toLowerCase().trim()) : ""; }
+let tutorProfile = null;  // the active tutor's persistent student profile
+async function loadProfile(t){
+  tutorProfile = null;
+  if (!t) return;
+  try { const r = await fetch("/api/tutor/profile/" + encodeURIComponent(teacherKey(t)));
+        if (r.ok) tutorProfile = await r.json(); } catch {}
+  if (!$("tutorsPanel").classList.contains("hidden")) refreshTutors();
+}
+// Compact student-model block woven into the tutor's system prompt so it teaches
+// adaptively: review weak spots, build on known words, match the level.
+function profileBlock(p){
+  if (!p) return "";
+  const take = (a, n) => (Array.isArray(a) && a.length) ? a.slice(-n).join(", ") : "";
+  const L = [];
+  if (p.level) L.push(`level: ${p.level}`);
+  const k = take(p.vocab_known, 40);        if (k) L.push(`already knows: ${k}`);
+  const l = take(p.vocab_learning, 25);      if (l) L.push(`still learning (reinforce): ${l}`);
+  const s = take(p.struggles, 12);           if (s) L.push(`struggles with: ${s}`);
+  const m = take(p.recurring_mistakes, 8);   if (m) L.push(`recent mistakes: ${m}`);
+  const t = take(p.topics_covered, 15);      if (t) L.push(`topics done: ${t}`);
+  if (p.goals) L.push(`goal: ${p.goals}`);
+  if (!L.length) return "";
+  return `\n\nSTUDENT SO FAR (teach adaptively — review weak spots, build on what they know, don't re-teach mastered words, match their level):\n- ${L.join("\n- ")}`;
+}
+// Ask the backend to update the student model from a finished lesson (off the
+// live voice loop). Fire-and-forget; refreshes the panel + cached profile.
+async function assessLesson(){
+  if (!currentTeacher || !Array.isArray(history) || history.length < 4) return;
+  try {
+    const r = await fetch("/api/tutor/assess", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lang: teacherKey(currentTeacher), messages: history.slice(-40) }) });
+    if (r.ok) { const p = await r.json(); if (p && !p.skipped && !p.error) {
+      tutorProfile = p;
+      if (!$("tutorsPanel").classList.contains("hidden")) refreshTutors();
+    } }
+  } catch {}
+}
+
 // Adaptive, SPOKEN tutor persona, built fresh for whichever language is active.
 // The model must know it is heard aloud and that the learner speaks back — that
 // is what turns it from a text chatbot into a voice teacher.
-function tutorPrompt(lang){
+function tutorPrompt(lang, profile){
   return `You are a warm, patient ${lang} teacher giving an English-speaking learner a LIVE SPOKEN lesson. Your words are read aloud and the learner replies out loud — a real voice conversation, NOT text chat. You CAN hear and speak; never imply otherwise.
 
 Teach like a real human teacher and meet the learner at their level:
@@ -391,7 +440,7 @@ Keep judging their level from how they respond and adjust continuously.
 
 ALWAYS follow the learner's language requests: if they ask you to speak English (or any language), switch immediately and STAY in it until they ask otherwise — never drift back to ${lang} on your own.
 
-Keep it a quick back-and-forth: one or two short sentences, then a question to keep them talking. Correct gently in passing — say the right version, no lectures or grammar lists. Speak in plain SPOKEN prose: NO markdown, asterisks, bullet points, headings or emoji (every character you write is read aloud); write numbers and symbols as words. For a non-Latin script, add a romanization in (parentheses). When you correct the learner, add the fix on its own final line starting with "✏️" — e.g. "✏️ nel mondo (not 'in il mondo')".`;
+Keep it a quick back-and-forth: one or two short sentences, then a question to keep them talking. Correct gently in passing — say the right version, no lectures or grammar lists. Speak in plain SPOKEN prose: NO markdown, asterisks, bullet points, headings or emoji (every character you write is read aloud); write numbers and symbols as words. For a non-Latin script, add a romanization in (parentheses). When you correct the learner, add the fix on its own final line starting with "✏️" — e.g. "✏️ nel mondo (not 'in il mondo')".` + profileBlock(profile);
 }
 
 // ── tiny Markdown renderer (no deps) ───────────────────────────────────────
@@ -1016,7 +1065,7 @@ async function _streamTurn(userContent, displayText, atts, opts){
       `<span style="color:var(--text-dim)">✂ Earlier messages trimmed to fit the model's context — full history is still saved.</span>`;
   }
   if (!sent.trimmed) trimNoteShown = false;   // re-arm the note if history shrinks (e.g. new chat)
-  const msgs = currentTeacher ? [{ role: "system", content: tutorPrompt(currentTeacher.name) }, ...sent.messages] : sent.messages;
+  const msgs = currentTeacher ? [{ role: "system", content: tutorPrompt(currentTeacher.name, tutorProfile) }, ...sent.messages] : sent.messages;
   // Deep-think off → hearth's `think:false` fast lane (a no-op on non-hearth backends).
   const req = deepThink ? { model, messages: msgs, stream: true }
                         : { model, messages: msgs, stream: true, think: false };
@@ -1343,6 +1392,7 @@ function toggleVoiceMode(){
     cancelTts();                                              // stop playback + unwedge its await
     if (streaming) controller?.abort();
     closeMic();                                               // release the persistent mic stream
+    assessLesson();                                           // update the student model from this lesson
   }
 }
 $("wavebtn").addEventListener("click", toggleVoiceMode);
@@ -1434,6 +1484,25 @@ function refreshTutors(){
   const gb = document.createElement("button"); gb.className = "pill"; gb.textContent = "Start";
   gb.addEventListener("click", go);
   cw.appendChild(inp); cw.appendChild(gb); te.appendChild(cw);
+
+  // Progress card for the active tutor — the persistent student model, so the
+  // learner sees what's tracked (and that the tutor remembers them).
+  if (currentTeacher && tutorProfile) {
+    const p = tutorProfile;
+    const n = (a) => Array.isArray(a) ? a.length : 0;
+    const card = document.createElement("div"); card.className = "tutorProgress";
+    const esc = (s) => escapeHtml(String(s || ""));
+    const struggles = (Array.isArray(p.struggles) && p.struggles.length)
+      ? `<div class="tprow"><span>Working on</span><b>${esc(p.struggles.slice(-3).join(", "))}</b></div>` : "";
+    card.innerHTML =
+      `<div class="tphead">📈 ${esc(currentTeacher.name)} progress</div>`
+      + `<div class="tprow"><span>Level</span><b>${esc(p.level || "—")}</b></div>`
+      + `<div class="tprow"><span>Words known</span><b>${n(p.vocab_known)}</b></div>`
+      + `<div class="tprow"><span>Learning</span><b>${n(p.vocab_learning)}</b></div>`
+      + `<div class="tprow"><span>Lessons</span><b>${p.sessions || 0}</b></div>`
+      + struggles;
+    te.appendChild(card);
+  }
 }
 
 document.addEventListener("keydown", (e) => {
@@ -1487,6 +1556,7 @@ $("chatsNew").addEventListener("click", () => { if (streaming) controller?.abort
 
 function setTeacher(t){
   currentTeacher = t;
+  loadProfile(t);       // pull the persistent student model for adaptive teaching
   populatePartners();   // rebuild + sync the partner dropdown (handles typed languages)
   if (!$("tutorsPanel").classList.contains("hidden")) refreshTutors();
   if (t) {

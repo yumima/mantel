@@ -159,9 +159,44 @@ def _open_chats_db() -> sqlite3.Connection:
     con.execute("CREATE TABLE IF NOT EXISTS messages("
                 "conv_id TEXT, seq INTEGER, role TEXT, content TEXT)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id)")
+    # Per-language tutor student model: a persistent profile (level, vocabulary,
+    # struggles, topics) so the language tutor teaches adaptively across sessions
+    # like a real teacher. One row per language key.
+    con.execute("CREATE TABLE IF NOT EXISTS tutor_profiles("
+                "lang TEXT PRIMARY KEY, profile TEXT, sessions INTEGER DEFAULT 0, updated REAL)")
     con.execute(f"PRAGMA user_version={_CHATS_SCHEMA_VERSION}")  # for future migrations
     con.commit()
     return con
+
+
+def _default_profile(lang: str) -> dict:
+    """A blank student model for a language not seen before."""
+    return {"lang": lang, "level": "A1 (beginner)", "goals": "",
+            "vocab_known": [], "vocab_learning": [], "struggles": [],
+            "topics_covered": [], "recurring_mistakes": [], "notes": "", "sessions": 0}
+
+
+def _extract_json_obj(text: str):
+    """Pull the last balanced {...} object out of an LLM reply (tolerant of a
+    leading <think> trace and prose around it). Returns a dict or None."""
+    import re
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+    end = text.rfind("}")
+    if end < 0:
+        return None
+    depth = 0
+    for i in range(end, -1, -1):
+        if text[i] == "}":
+            depth += 1
+        elif text[i] == "{":
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(text[i:end + 1])
+                    return obj if isinstance(obj, dict) else None
+                except Exception:
+                    return None
+    return None
 
 
 async def _shutdown_shared(app: FastAPI) -> None:
@@ -457,6 +492,108 @@ def create_app(cfg: cfgmod.Config | None = None, host=None) -> FastAPI:
         async with app.state.db_lock:
             await asyncio.to_thread(_write)
         return JSONResponse({"ok": True})
+
+    # ── Adaptive language tutor: persistent per-language student model ─────────
+    @app.get("/api/tutor/profile/{lang}")
+    async def tutor_get_profile(lang: str) -> JSONResponse:
+        """The student's stored profile for a language (level, vocabulary,
+        struggles, …), or a blank one if this language is new."""
+        con = _db()
+
+        def _read():
+            return con.execute("SELECT profile, sessions FROM tutor_profiles WHERE lang=?",
+                               (lang,)).fetchone()
+
+        async with app.state.db_lock:
+            row = await asyncio.to_thread(_read)
+        if not row:
+            return JSONResponse(_default_profile(lang))
+        try:
+            p = json.loads(row[0])
+        except Exception:
+            p = _default_profile(lang)
+        p["lang"] = lang
+        p["sessions"] = row[1] or 0
+        return JSONResponse(p)
+
+    @app.post("/api/tutor/assess")
+    async def tutor_assess(request: Request) -> JSONResponse:
+        """End-of-lesson assessment: given the prior profile + this lesson's
+        transcript, have the model produce an UPDATED student profile, persist
+        it, and return it. Runs off the live voice loop, so latency is fine."""
+        body = await request.json()
+        lang = (body.get("lang") or "").strip()
+        messages = body.get("messages") or []
+        if not lang or not isinstance(messages, list) or len(messages) < 4:
+            return JSONResponse({"skipped": True})
+        con = _db()
+
+        def _read():
+            return con.execute("SELECT profile, sessions FROM tutor_profiles WHERE lang=?",
+                               (lang,)).fetchone()
+
+        async with app.state.db_lock:
+            row = await asyncio.to_thread(_read)
+        prior, sessions = _default_profile(lang), 0
+        if row:
+            try:
+                prior = json.loads(row[0])
+            except Exception:
+                pass
+            sessions = row[1] or 0
+
+        def _text(c):
+            return c if isinstance(c, str) else json.dumps(c)
+        transcript = "\n".join(
+            f"{m.get('role','')}: {_text(m.get('content',''))}"
+            for m in messages if isinstance(m, dict) and m.get("role") in ("user", "assistant"))
+        transcript = transcript[-8000:]
+
+        sys = ("You are a language-learning progress tracker. Given a student's PRIOR "
+               "profile JSON and a lesson TRANSCRIPT, output an UPDATED profile as a "
+               "SINGLE JSON object with exactly these keys: lang, level, goals, "
+               "vocab_known, vocab_learning, struggles, topics_covered, "
+               "recurring_mistakes, notes. Adjust 'level' (CEFR A1–C2) only on clear "
+               "evidence. Append genuinely new words the student PRODUCED correctly to "
+               "vocab_known; words they were taught but haven't mastered to "
+               "vocab_learning; grammar/patterns they struggled with to struggles; "
+               "concrete errors to recurring_mistakes; new subjects to topics_covered. "
+               "Keep every list deduplicated and concise (cap ~40 items, drop oldest). "
+               "Output ONLY the JSON object, nothing before or after it.")
+        user = f"PRIOR PROFILE:\n{json.dumps(prior)}\n\nLESSON TRANSCRIPT:\n{transcript}"
+        prov = app.state.cfg.active()
+        req = {"model": app.state.cfg.model, "think": False, "stream": False,
+               "messages": [{"role": "system", "content": sys},
+                            {"role": "user", "content": user}]}
+        try:
+            r = await _http().post(f"{prov.base_url}/chat/completions", json=req,
+                                   headers=prov.headers(), timeout=120.0)
+            r.raise_for_status()
+            content = (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
+        except Exception as e:
+            return JSONResponse({"error": f"assess failed: {e}"}, status_code=502)
+
+        updated = _extract_json_obj(content)
+        if not updated:
+            return JSONResponse({"error": "no profile returned"}, status_code=502)
+        # Authoritative server-side fields — never trust the model with these.
+        updated["lang"] = lang
+        sessions += 1
+        updated["sessions"] = sessions
+        now = time.time()
+        blob = json.dumps(updated)
+
+        def _write():
+            con.execute(
+                "INSERT INTO tutor_profiles(lang,profile,sessions,updated) VALUES(?,?,?,?) "
+                "ON CONFLICT(lang) DO UPDATE SET profile=excluded.profile, "
+                "sessions=excluded.sessions, updated=excluded.updated",
+                (lang, blob, sessions, now))
+            con.commit()
+
+        async with app.state.db_lock:
+            await asyncio.to_thread(_write)
+        return JSONResponse(updated)
 
     @app.post("/api/extract")
     async def api_extract(file: UploadFile = File(...)) -> JSONResponse:
