@@ -229,11 +229,35 @@
   button:hover > .ctip { opacity: 1; transform: translateX(-50%) translateY(0); }
 
   /* live-voice overlay */
-  #live { position: fixed; inset: 0 0 0 var(--rail); z-index: 80; background: rgba(15,16,20,.96);
-    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 28px; }
+  /* Live-voice controls sit in a compact bottom BAR (not a full-screen cover)
+     so the conversation in #thread stays visible and readable above them. */
+  #live { position: fixed; left: var(--rail); right: 0; bottom: 0; z-index: 80;
+    background: var(--bg-elev); border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+    box-shadow: 0 -10px 28px -16px rgba(0,0,0,.6); }
   #live.hidden { display: none; }
-  #live .who { font-size: 14px; color: var(--text-dim); letter-spacing: .3px; }
-  #live .status { font-size: 16px; color: var(--text); }
+  #live .livetext { display: flex; flex-direction: column; gap: 2px; flex: 1 1 auto; min-width: 0; }
+  #live .who { font-size: 12px; color: var(--text-dim); letter-spacing: .3px; }
+  #live .status { font-size: 15px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #live .orb { width: 46px; height: 46px; flex: 0 0 auto; box-shadow: 0 0 20px -8px var(--accent-dim); }
+  /* While voice mode is active, hide the text composer and give the thread
+     room so its last message clears the fixed bottom bar. */
+  body.voicing footer { display: none; }
+  body.voicing main { padding-bottom: 96px; }
+  /* Reviewable corrections list (the tutor's ✏️ lines), beside the bottom bar. */
+  #corrections { position: fixed; right: 14px; bottom: 86px; z-index: 79; width: 290px; max-height: 42vh;
+    background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+    display: none; flex-direction: column; box-shadow: 0 8px 28px -14px rgba(0,0,0,.6); }
+  body.voicing #corrections.show { display: flex; }
+  #corrections .corrHead { padding: 8px 12px; font-size: 12px; font-weight: 600; color: var(--text-dim);
+    border-bottom: 1px solid var(--border); flex: 0 0 auto; }
+  #corrections .corrList { overflow-y: auto; padding: 4px 12px; }
+  #corrections .corrItem { font-size: 13px; color: var(--text); padding: 5px 0; border-bottom: 1px solid var(--border); }
+  #corrections .corrItem:last-child { border-bottom: 0; }
+  .tutorCustom { display: flex; gap: 6px; margin-top: 8px; width: 100%; }
+  .tutorCustomInput { flex: 1 1 auto; min-width: 0; background: var(--bg-input); color: var(--text);
+    border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px; font-size: 13px; }
+  .tutorCustomInput:focus { outline: none; border-color: var(--accent); }
   .orb { position: relative; width: 150px; height: 150px; border-radius: 50%;
     background: radial-gradient(circle at 50% 45%, var(--accent), var(--accent-dim) 70%);
     box-shadow: 0 0 50px -6px var(--accent-dim); display: grid; place-items: center; }
@@ -244,8 +268,8 @@
   .orb.work::before, .orb.work::after { animation-duration: 1.2s; }
   @keyframes pulse { 0% { transform: scale(1); opacity: .5; } 100% { transform: scale(1.7); opacity: 0; } }
   @keyframes orbpulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.08); } }
-  #live .stop { background: var(--err); color: #fff; border: 0; border-radius: 30px; padding: 12px 30px;
-    font-size: 15px; font-weight: 600; cursor: pointer; }
+  #live .stop { flex: 0 0 auto; background: var(--err); color: #fff; border: 0; border-radius: 22px;
+    padding: 9px 20px; font-size: 14px; font-weight: 600; cursor: pointer; }
   #live .stop:hover { filter: brightness(1.1); }
 </style>
 </head>
@@ -312,11 +336,17 @@
       <section><h4>Tools <span id="cfgToolCount" class="muted"></span></h4><div id="cfgTools"></div></section>
     </div>
   </aside>
-  <div id="live" class="hidden" role="dialog" aria-label="Live voice conversation" aria-modal="true">
-    <div class="who" id="liveWho">Assistant</div>
+  <div id="live" class="hidden" role="region" aria-label="Live voice conversation">
     <div class="orb" id="liveOrb"></div>
-    <div class="status" id="liveStatus">starting…</div>
+    <div class="livetext">
+      <div class="who" id="liveWho">Assistant</div>
+      <div class="status" id="liveStatus">starting…</div>
+    </div>
     <button class="stop" id="liveStop" aria-label="Stop live voice">■ Stop</button>
+  </div>
+  <div id="corrections" aria-label="Corrections" aria-live="polite">
+    <div class="corrHead">✏️ Corrections</div>
+    <div class="corrList"></div>
   </div>
 <script>
 "use strict";
@@ -335,14 +365,28 @@ let trimNoteShown = false;  // have we already told the user that context was tr
 const CTX_CHAR_BUDGET = 48000;   // ≈ 12k tokens
 const CTX_MIN_TURNS = 4;         // always keep at least the last few messages
 let currentTeacher = null;  // active language-tutor persona (null = normal chat)
-// Language tutors: code = whisper language hint, voice = piper voice id, prompt = persona.
+// Language tutors. Voiced presets (native Piper voice); any other language can
+// be typed in the Tutors panel — STT auto-detects and TTS falls back to an
+// English voice. code = whisper language hint ("" = auto-detect), voice = piper id.
 const TEACHERS = [
-  { code: "it", name: "Italian",  voice: "it_IT-paola-medium",     prompt: "You are Marco, a warm, patient Italian conversation tutor. Speak mostly in simple, natural Italian matched to a beginner–intermediate learner; keep sentences short. When the learner makes a mistake, gently restate it correctly, then continue with a follow-up question. Add a brief English hint in (parentheses) only for hard words. Keep replies to 1–3 sentences so it stays a real back-and-forth conversation." },
-  { code: "fr", name: "French",   voice: "fr_FR-siwis-medium",     prompt: "You are Camille, a warm, patient French conversation tutor. Speak mostly in simple, natural French matched to the learner; short sentences. Gently restate mistakes correctly, then ask a follow-up. Brief English hints in (parentheses) for hard words only. Keep replies to 1–3 sentences." },
-  { code: "es", name: "Spanish",  voice: "es_ES-davefx-medium",    prompt: "You are Lucía, a warm, patient Spanish conversation tutor. Speak mostly in simple, natural Spanish matched to the learner; short sentences. Gently restate mistakes correctly, then ask a follow-up. Brief English hints in (parentheses) for hard words only. Keep replies to 1–3 sentences." },
-  { code: "de", name: "German",   voice: "de_DE-thorsten-medium",  prompt: "You are Lukas, a warm, patient German conversation tutor. Speak mostly in simple, natural German matched to the learner; short sentences. Gently restate mistakes correctly, then ask a follow-up. Brief English hints in (parentheses) for hard words only. Keep replies to 1–3 sentences." },
-  { code: "zh", name: "Mandarin", voice: "zh_CN-huayan-medium",    prompt: "You are 小梅 (Xiǎo Méi), a warm, patient Mandarin Chinese conversation tutor. Speak mostly in simple Mandarin matched to the learner; short sentences. Write Chinese characters followed by pinyin in (parentheses) plus a brief English gloss for hard words. Gently restate mistakes correctly, then ask a follow-up. Keep replies to 1–3 sentences." },
+  { code: "it", name: "Italian",  voice: "it_IT-paola-medium" },
+  { code: "fr", name: "French",   voice: "fr_FR-siwis-medium" },
+  { code: "es", name: "Spanish",  voice: "es_ES-davefx-medium" },
+  { code: "de", name: "German",   voice: "de_DE-thorsten-medium" },
+  { code: "zh", name: "Mandarin", voice: "zh_CN-huayan-medium" },
 ];
+// A typed language becomes a tutor too (auto-detect STT, English fallback TTS).
+function customTeacher(name){ return { code: "", name: name.trim(), voice: "", custom: true }; }
+// Adaptive, SPOKEN tutor persona, built fresh for whichever language is active.
+// The model must know it is heard aloud and that the learner speaks back — that
+// is what turns it from a text chatbot into a voice teacher.
+function tutorPrompt(lang){
+  return `You are a warm, patient ${lang} teacher leading a LIVE SPOKEN lesson. Your words are read out loud to the learner by a voice, and the learner talks back to you out loud — this is a real voice conversation, NOT a text chat. You CAN hear and speak; never say or imply otherwise.
+
+Lead the lesson and adapt: judge the learner's level from how they speak and match it, starting simple. Keep them talking — teach one small thing (a useful word or phrase), then ask a question. Correct in passing: when they slip, just say the right version naturally and move on; do not lecture or list grammar rules.
+
+Speak mostly in ${lang}, in ONE or TWO short sentences, so it stays a quick back-and-forth and is fast to say aloud. Put a brief English hint in (parentheses) only for a genuinely hard word. Write numbers and symbols as words. For a non-Latin script, follow the ${lang} text with its romanization in (parentheses). Whenever you correct the learner, ALSO add the correction on its own final line starting with "✏️" — e.g. "✏️ nel mondo (not 'in il mondo')" — for them to review.`;
+}
 
 // ── tiny Markdown renderer (no deps) ───────────────────────────────────────
 function escapeHtml(s){ return s.replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
@@ -813,9 +857,11 @@ function populatePartners(){
   const add = (v, l) => { const o = document.createElement("option"); o.value = v; o.textContent = l; sel.appendChild(o); };
   add("", "🗣 Assistant");
   for (const t of TEACHERS) add(t.code, "🎓 " + t.name + " tutor");
-  sel.value = currentTeacher ? currentTeacher.code : "";
+  if (currentTeacher && currentTeacher.custom) add("custom", "🎓 " + currentTeacher.name + " tutor");
+  sel.value = currentTeacher ? (currentTeacher.custom ? "custom" : currentTeacher.code) : "";
 }
 $("partner").addEventListener("change", (e) => {
+  if (e.target.value === "custom") return;   // already the active typed-language tutor
   setTeacher(TEACHERS.find(x => x.code === e.target.value) || null);
 });
 populatePartners();
@@ -936,19 +982,22 @@ async function send(){
 // Returns the answer text ("" / null on error or nav-away). Reused by send() and
 // the hands-free voice loop.
 let turnInFlight = false;
-async function streamTurn(userContent, displayText, atts){
+async function streamTurn(userContent, displayText, atts, opts){
   // Serialize turns so a manual send and the voice loop never interleave on the
   // shared history / controller / streaming state.
   while (turnInFlight) await new Promise(r => setTimeout(r, 60));
   turnInFlight = true;
-  try { return await _streamTurn(userContent, displayText, atts); }
+  try { return await _streamTurn(userContent, displayText, atts, opts || {}); }
   finally { turnInFlight = false; }
 }
-async function _streamTurn(userContent, displayText, atts){
+async function _streamTurn(userContent, displayText, atts, opts){
+  opts = opts || {};
   if (!currentConvId) currentConvId = _uuid();
   const convId0 = currentConvId;   // pin this turn to its conversation
   history.push({ role: "user", content: userContent });
-  renderUserBubble(addBubble("user"), displayText, atts); scrollDown(true);
+  // The tutor-led opener pushes a hidden kickoff (no user bubble) so the lesson
+  // can start with the teacher greeting instead of waiting for the learner.
+  if (!opts.silentUser) { renderUserBubble(addBubble("user"), displayText, atts); scrollDown(true); }
   const wrap = addBubble("assistant");
   let answer = "", reasoning = "", gotContent = false, err = null;
   setContent(wrap, "", false, true); scrollDown(true);
@@ -961,11 +1010,14 @@ async function _streamTurn(userContent, displayText, atts){
       `<span style="color:var(--text-dim)">✂ Earlier messages trimmed to fit the model's context — full history is still saved.</span>`;
   }
   if (!sent.trimmed) trimNoteShown = false;   // re-arm the note if history shrinks (e.g. new chat)
-  const msgs = currentTeacher ? [{ role: "system", content: currentTeacher.prompt }, ...sent.messages] : sent.messages;
+  const msgs = currentTeacher ? [{ role: "system", content: tutorPrompt(currentTeacher.name) }, ...sent.messages] : sent.messages;
   // Deep-think off → hearth's `think:false` fast lane (a no-op on non-hearth backends).
   const req = deepThink ? { model, messages: msgs, stream: true }
                         : { model, messages: msgs, stream: true, think: false };
   setSending(true); controller = new AbortController();
+  // Arm barge-in only now that THIS turn owns `controller`, so an interruption
+  // can't abort a previous (e.g. still-serializing) turn.
+  if (voiceMode && !bargedIn) startBargeMonitor();
   if (!voiceMode) setActivity("💭 Thinking…", "work");   // visible while the model loads/reasons
   let raf = 0;
   const paint = () => { raf = 0; setReasoning(wrap, gotContent ? "" : reasoning); setContent(wrap, answer, true, true); if (reasoning && !gotContent) wrap.querySelector(".think").open = true; scrollDown(); };
@@ -984,7 +1036,7 @@ async function _streamTurn(userContent, displayText, atts){
         const d = (obj.choices && obj.choices[0] && obj.choices[0].delta) || {};
         const reason = d.reasoning || d.reasoning_content || "";
         if (reason && !gotContent) { reasoning += reason; schedule(); }
-        if (d.content) { if (!gotContent && !voiceMode) setActivity("", ""); gotContent = true; answer += d.content; schedule(); }
+        if (d.content) { if (!gotContent && !voiceMode) setActivity("", ""); gotContent = true; answer += d.content; schedule(); if (voiceMode && !bargedIn) pumpVoiceSentences(answer, false); }
         return false;
       };
       const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "", stop = false;
@@ -1012,6 +1064,7 @@ async function _streamTurn(userContent, displayText, atts){
     setSending(false); controller = null; return null;
   }
   setContent(wrap, answer, true, false);
+  if (voiceMode && !bargedIn) { pumpVoiceSentences(answer, true); collectCorrections(answer); }  // speak the tail; log corrections (skip if interrupted)
   if (answer) { history.push({ role: "assistant", content: answer }); addSpeakBtn(wrap, answer); saveChat(); }
   else { history.pop(); wrap.remove(); }
   setSending(false); controller = null;
@@ -1044,40 +1097,76 @@ function voiceStatus(s){
     st.textContent = `${icon} ${t}`;
   }
 }
+// Speech epoch: bumped by resetVoiceSpeech() (e.g. on barge-in). A sentence
+// whose synthesis was already in flight when the epoch changes must NOT start
+// playing — it belongs to an interrupted reply.
+let voiceEpoch = 0;
+// Stop whatever is playing now AND resolve its pending speakText promise, so the
+// drain loop's `await` never wedges when we cut playback mid-sentence.
+function cancelTts(){
+  const a = ttsAudio;
+  if (a) { try { a.pause(); } catch {} ttsAudio = null; if (a._done) a._done(); }
+}
 function speakText(text, voice){
+  const myEpoch = voiceEpoch;
   return new Promise(async (resolve) => {
     try {
       const r = await fetch("/api/speak", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(voice ? { text, voice } : { text }) });
-      if (!r.ok) { resolve(); return; }
+      if (!r.ok || myEpoch !== voiceEpoch || !voiceMode) { resolve(); return; }   // interrupted while synthesizing
       const url = URL.createObjectURL(await r.blob());
+      if (myEpoch !== voiceEpoch || !voiceMode) { URL.revokeObjectURL(url); resolve(); return; }
       const a = new Audio(url); ttsAudio = a;
       const done = () => { if (ttsAudio === a) ttsAudio = null; URL.revokeObjectURL(url); resolve(); };
-      a.onended = done; a.onerror = done;
+      a._done = done; a.onended = done; a.onerror = done;
+      if (myEpoch !== voiceEpoch || !voiceMode) { done(); return; }   // barged during setup → don't start
       a.play().catch(done);
     } catch { resolve(); }
   });
 }
-// Record until the user stops talking (simple RMS VAD). Resolves to an audio Blob,
-// or null if aborted / nothing said.
-function listenWithVAD(maxMs = 15000, silenceMs = 1200){
+// ── Persistent microphone (open for the whole voice session) ──────────────────
+// Borrowed from full-duplex clients (Moshi/personaplex keep ONE mic stream open
+// continuously). Here it lets us keep listening EVEN WHILE the tutor speaks —
+// the prerequisite for barge-in in a cascaded STT→LLM→TTS pipeline. Browser AEC
+// (echoCancellation) suppresses the tutor's own voice in the mic so a real
+// interruption stands out above the residual echo floor.
+let micSession = null;
+async function ensureMic(){
+  if (micSession) return micSession;
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  try { await ctx.resume(); } catch {}
+  const analyser = ctx.createAnalyser(); analyser.fftSize = 512;
+  ctx.createMediaStreamSource(stream).connect(analyser);
+  micSession = { stream, ctx, analyser, data: new Uint8Array(analyser.fftSize) };
+  return micSession;
+}
+function micRms(){
+  if (!micSession) return 0;
+  micSession.analyser.getByteTimeDomainData(micSession.data);
+  let sum = 0; for (const v of micSession.data) { const x = (v - 128) / 128; sum += x * x; }
+  return Math.sqrt(sum / micSession.data.length);
+}
+function closeMic(){
+  if (!micSession) return;
+  try { micSession.stream.getTracks().forEach(t => t.stop()); } catch {}
+  micSession.ctx.close().catch(() => {});
+  micSession = null;
+}
+
+// Record until the user stops talking (simple RMS VAD over the persistent mic).
+// Resolves to an audio Blob, or null if aborted / nothing said. The stream is
+// NOT torn down here (it lives for the whole session) — only the recorder.
+function listenWithVAD(maxMs = 15000, silenceMs = 900){
   return new Promise(async (resolve) => {
-    let stream;
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
-    catch { resolve(null); return; }
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    try { await ctx.resume(); } catch {}
-    const analyser = ctx.createAnalyser(); analyser.fftSize = 512;
-    ctx.createMediaStreamSource(stream).connect(analyser);
-    const rec = new MediaRecorder(stream); const chunks = [];
+    const m = await ensureMic().catch(() => null);
+    if (!m) { resolve(null); return; }
+    const rec = new MediaRecorder(m.stream); const chunks = [];
     rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
-    const data = new Uint8Array(analyser.fftSize);
     let spoke = false, lastLoud = performance.now(), start = performance.now(), raf = 0, settled = false, backstop = 0;
     const finish = (aborted) => {
       if (settled) return; settled = true;                 // resolve exactly once
       if (raf) cancelAnimationFrame(raf);
       if (backstop) clearTimeout(backstop);
-      try { stream.getTracks().forEach(t => t.stop()); } catch {}
-      ctx.close().catch(() => {});
       const blob = () => new Blob(chunks, { type: rec.mimeType || "audio/webm" });
       rec.onstop = () => resolve(aborted ? null : blob());
       try { if (rec.state !== "inactive") rec.stop(); else resolve(aborted ? null : blob()); }
@@ -1085,10 +1174,8 @@ function listenWithVAD(maxMs = 15000, silenceMs = 1200){
     };
     const tick = () => {
       if (!voiceMode) { finish(true); return; }
-      analyser.getByteTimeDomainData(data);
-      let sum = 0; for (const v of data) { const x = (v - 128) / 128; sum += x * x; }
-      const rms = Math.sqrt(sum / data.length), now = performance.now();
-      if (rms > 0.045) { spoke = true; lastLoud = now; }
+      const rms = micRms(), now = performance.now();
+      if (rms > 0.022) { spoke = true; lastLoud = now; }   // lower bar: tolerate quiet mics, react sooner
       voiceStatus(spoke ? "listening…" : "waiting for you to speak…");
       if ((spoke && now - lastLoud > silenceMs) || now - start > maxMs) { finish(false); return; }
       raf = requestAnimationFrame(tick);
@@ -1099,6 +1186,40 @@ function listenWithVAD(maxMs = 15000, silenceMs = 1200){
     rec.start(); raf = requestAnimationFrame(tick);
   });
 }
+
+// ── Barge-in: interrupt the tutor by speaking ─────────────────────────────────
+// While the tutor talks, poll the (always-open) mic. Sustained energy above the
+// echo floor = the learner cut in → stop TTS, abort the in-flight reply, and go
+// straight back to listening. Tunables are conservative so the tutor's own
+// (AEC-attenuated) voice doesn't self-trigger. With a headset (no acoustic echo)
+// barge-in is crisp; on open speakers, raise BARGE_RMS if it self-interrupts.
+let bargeTimer = 0, bargedIn = false;
+const BARGE_RMS = 0.05;     // must clear residual echo left after AEC
+const BARGE_FRAMES = 5;     // ~200ms sustained, so a click/echo blip won't fire
+function startBargeMonitor(){
+  stopBargeMonitor();
+  let hits = 0;
+  const armAt = performance.now() + 350;   // grace: don't let the first syllable self-trigger
+  const poll = () => {
+    if (!voiceMode) return;
+    if (performance.now() >= armAt) {
+      const rms = micRms();
+      hits = rms > BARGE_RMS ? hits + 1 : Math.max(0, hits - 1);
+      if (hits >= BARGE_FRAMES) { triggerBargeIn(); return; }
+    }
+    bargeTimer = setTimeout(poll, 40);
+  };
+  bargeTimer = setTimeout(poll, 40);
+}
+function stopBargeMonitor(){ if (bargeTimer) { clearTimeout(bargeTimer); bargeTimer = 0; } }
+function triggerBargeIn(){
+  bargedIn = true;
+  stopBargeMonitor();
+  resetVoiceSpeech();                                   // bump epoch + drop queued sentences
+  cancelTts();                                          // stop current sentence + unwedge its await
+  try { controller?.abort(); } catch {}                 // stop the in-flight LLM reply
+  voiceStatus("listening…");
+}
 async function transcribeBlob(blob, language){
   try {
     const fd = new FormData(); fd.append("file", blob, "speech.webm");
@@ -1108,11 +1229,67 @@ async function transcribeBlob(blob, language){
     return r.ok ? (j.text || "").trim() : "";
   } catch { return ""; }
 }
+// ── streamed speech: speak each sentence as the model produces it ─────────────
+// Time-to-first-voice drops from "whole reply generated" to ~one sentence, so
+// the tutor starts talking almost immediately — the core of the real-time feel.
+let voiceQueue = [];        // sentences awaiting TTS, in order
+let voiceSpeaking = false;  // a sentence is currently playing
+let voiceSpokenLen = 0;     // chars of the answer already chunked into the queue
+function resetVoiceSpeech(){ voiceEpoch++; voiceQueue = []; voiceSpokenLen = 0; }
+// Clean a sentence for the voice: drop parenthetical glosses and ✏️ correction
+// lines — those are for the eyes, not the ear.
+function speakable(s){
+  const t = s.trim();
+  if (!t || t.startsWith("✏️")) return "";
+  return t.replace(/\([^)]*\)/g, "").replace(/✏️/g, "").replace(/\s+/g, " ").trim();
+}
+function pumpVoiceSentences(answer, done){
+  const rest = answer.slice(voiceSpokenLen);
+  const re = /[^.!?。．！？…\n]*[.!?。．！？…\n]+/g;   // complete sentence / line chunks
+  let m, consumed = 0;
+  while ((m = re.exec(rest))) { const s = speakable(m[0]); if (s) voiceQueue.push(s); consumed = re.lastIndex; }
+  voiceSpokenLen += consumed;
+  if (done) { const tail = speakable(answer.slice(voiceSpokenLen)); if (tail) voiceQueue.push(tail); voiceSpokenLen = answer.length; }
+  drainVoiceQueue();
+}
+async function drainVoiceQueue(){
+  if (voiceSpeaking) return;                              // a single player keeps order
+  voiceSpeaking = true;
+  try { while (voiceMode && voiceQueue.length) { voiceStatus("speaking…"); await speakText(voiceQueue.shift(), currentTeacher?.voice); } }
+  finally { voiceSpeaking = false; }
+}
+async function waitForVoiceDrain(){
+  while (voiceMode && (voiceSpeaking || voiceQueue.length)) await new Promise(r => setTimeout(r, 80));
+}
+// Pull the tutor's "✏️ …" correction lines into the review list beside the bar.
+function collectCorrections(answer){
+  const lines = answer.split("\n").map(s => s.trim()).filter(s => s.startsWith("✏️"));
+  const box = $("corrections"); if (!box || !lines.length) return;
+  const list = box.querySelector(".corrList");
+  for (const l of lines){ const it = document.createElement("div"); it.className = "corrItem"; it.textContent = l.replace(/^✏️\s*/, ""); list.appendChild(it); }
+  box.classList.add("show"); list.scrollTop = list.scrollHeight;
+}
 let voiceLoopRunning = false;
 async function voiceLoop(){
   if (voiceLoopRunning) return;                          // never run two loops at once
   voiceLoopRunning = true;
   try {
+    await ensureMic().catch(() => {});   // open the mic up front (primes permission + barge-in)
+    // One "reply" step: stream + speak while watching for the learner to cut in.
+    const replyTurn = async (userContent, displayText, opts) => {
+      voiceStatus("thinking…"); resetVoiceSpeech(); bargedIn = false;
+      await streamTurn(userContent, displayText, [], opts);   // _streamTurn arms barge-in once it owns the controller
+      if (!bargedIn && voiceMode) await waitForVoiceDrain();   // finish speaking before listening again
+      stopBargeMonitor();
+      // If interrupted, fall straight through to listening — the learner is
+      // already mid-utterance, so listenWithVAD will capture the rest.
+    };
+    // Tutor leads: open the lesson with a greeting + first question rather than
+    // sitting silent until the learner happens to speak.
+    if (currentTeacher && !history.length){
+      await replyTurn(`(The spoken lesson is starting now. Greet me in ${currentTeacher.name}, tell me you'll be my ${currentTeacher.name} teacher, and ask an easy first question.)`,
+                      "", { silentUser: true });
+    }
     while (voiceMode) {
       const blob = await listenWithVAD();
       if (!voiceMode) break;
@@ -1121,19 +1298,26 @@ async function voiceLoop(){
       const text = await transcribeBlob(blob, currentTeacher?.code);
       if (!voiceMode) break;
       if (!text) continue;
-      voiceStatus("thinking…");
-      const answer = await streamTurn(text, text, []);
-      if (!voiceMode) break;
-      if (answer && answer.trim()) { voiceStatus("speaking…"); await speakText(answer, currentTeacher?.voice); }
+      await replyTurn(text, text);                        // speaks as it streams; barge-in interrupts
     }
-  } finally { voiceLoopRunning = false; voiceStatus(""); }
+  } finally { voiceLoopRunning = false; stopBargeMonitor(); voiceStatus(""); }
 }
 function toggleVoiceMode(){
   voiceMode = !voiceMode;
   $("wavebtn").classList.toggle("on", voiceMode);
-  $("live").classList.toggle("hidden", !voiceMode);   // full-area live-voice overlay
-  if (voiceMode) { voiceStatus("starting…"); voiceLoop(); }
-  else { if (ttsAudio) { try { ttsAudio.pause(); } catch {} } if (streaming) controller?.abort(); }
+  $("live").classList.toggle("hidden", !voiceMode);          // bottom live-voice bar
+  document.body.classList.toggle("voicing", voiceMode);      // hide composer, free the thread
+  if (voiceMode) {
+    bargedIn = false; resetVoiceSpeech();
+    const cb = $("corrections"); if (cb){ cb.classList.remove("show"); cb.querySelector(".corrList").innerHTML = ""; }
+    voiceStatus("starting…"); voiceLoop();
+  } else {
+    stopBargeMonitor();
+    resetVoiceSpeech();                                       // bump epoch + clear the queue
+    cancelTts();                                              // stop playback + unwedge its await
+    if (streaming) controller?.abort();
+    closeMic();                                               // release the persistent mic stream
+  }
 }
 $("wavebtn").addEventListener("click", toggleVoiceMode);
 $("liveStop").addEventListener("click", () => { if (voiceMode) toggleVoiceMode(); });
@@ -1212,6 +1396,18 @@ function refreshTutors(){
     b.className = "pill" + (currentTeacher && currentTeacher.code === t.code ? " on" : "");
     b.textContent = t.name; b.addEventListener("click", () => setTeacher(t)); te.appendChild(b);
   }
+  // Any other language — typed by the learner (STT auto-detects; TTS uses an
+  // English fallback voice since only the presets have a native Piper voice).
+  const cw = document.createElement("div"); cw.className = "tutorCustom";
+  const inp = document.createElement("input");
+  inp.type = "text"; inp.className = "tutorCustomInput";
+  inp.placeholder = "Other language… (e.g. Japanese)";
+  if (currentTeacher && currentTeacher.custom) inp.value = currentTeacher.name;
+  const go = () => { const v = inp.value.trim(); if (v) setTeacher(customTeacher(v)); };
+  inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); go(); } });
+  const gb = document.createElement("button"); gb.className = "pill"; gb.textContent = "Start";
+  gb.addEventListener("click", go);
+  cw.appendChild(inp); cw.appendChild(gb); te.appendChild(cw);
 }
 
 document.addEventListener("keydown", (e) => {
@@ -1265,7 +1461,7 @@ $("chatsNew").addEventListener("click", () => { if (streaming) controller?.abort
 
 function setTeacher(t){
   currentTeacher = t;
-  const sel = $("partner"); if (sel) sel.value = t ? t.code : "";   // keep partner state in sync
+  populatePartners();   // rebuild + sync the partner dropdown (handles typed languages)
   if (!$("tutorsPanel").classList.contains("hidden")) refreshTutors();
   if (t) {
     addBubble("system").querySelector(".content").innerHTML =
