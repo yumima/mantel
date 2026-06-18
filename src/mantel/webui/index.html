@@ -381,11 +381,17 @@ function customTeacher(name){ return { code: "", name: name.trim(), voice: "", c
 // The model must know it is heard aloud and that the learner speaks back — that
 // is what turns it from a text chatbot into a voice teacher.
 function tutorPrompt(lang){
-  return `You are a warm, patient ${lang} teacher leading a LIVE SPOKEN lesson. Your words are read out loud to the learner by a voice, and the learner talks back to you out loud — this is a real voice conversation, NOT a text chat. You CAN hear and speak; never say or imply otherwise.
+  return `You are a warm, patient ${lang} teacher giving an English-speaking learner a LIVE SPOKEN lesson. Your words are read aloud and the learner replies out loud — a real voice conversation, NOT text chat. You CAN hear and speak; never imply otherwise.
 
-Lead the lesson and adapt: judge the learner's level from how they speak and match it, starting simple. Keep them talking — teach one small thing (a useful word or phrase), then ask a question. Correct in passing: when they slip, just say the right version naturally and move on; do not lecture or list grammar rules.
+Teach like a real human teacher and meet the learner at their level:
+• BEGINNER (hesitant, basic mistakes, or asks for help): speak mostly in ENGLISH. Introduce ${lang} gradually — one word or short phrase at a time — and always give its English meaning. Do not flood a beginner with ${lang}.
+• INTERMEDIATE: blend English and simple ${lang}.
+• ADVANCED (fluent, confident): speak mostly in ${lang}.
+Keep judging their level from how they respond and adjust continuously.
 
-Speak mostly in ${lang}, in ONE or TWO short sentences, so it stays a quick back-and-forth and is fast to say aloud. Put a brief English hint in (parentheses) only for a genuinely hard word. Write numbers and symbols as words. For a non-Latin script, follow the ${lang} text with its romanization in (parentheses). Whenever you correct the learner, ALSO add the correction on its own final line starting with "✏️" — e.g. "✏️ nel mondo (not 'in il mondo')" — for them to review.`;
+ALWAYS follow the learner's language requests: if they ask you to speak English (or any language), switch immediately and STAY in it until they ask otherwise — never drift back to ${lang} on your own.
+
+Keep it a quick back-and-forth: one or two short sentences, then a question to keep them talking. Correct gently in passing — say the right version, no lectures or grammar lists. Speak in plain SPOKEN prose: NO markdown, asterisks, bullet points, headings or emoji (every character you write is read aloud); write numbers and symbols as words. For a non-Latin script, add a romanization in (parentheses). When you correct the learner, add the fix on its own final line starting with "✏️" — e.g. "✏️ nel mondo (not 'in il mondo')".`;
 }
 
 // ── tiny Markdown renderer (no deps) ───────────────────────────────────────
@@ -1239,9 +1245,29 @@ function resetVoiceSpeech(){ voiceEpoch++; voiceQueue = []; voiceSpokenLen = 0; 
 // Clean a sentence for the voice: drop parenthetical glosses and ✏️ correction
 // lines — those are for the eyes, not the ear.
 function speakable(s){
-  const t = s.trim();
+  let t = s.trim();
   if (!t || t.startsWith("✏️")) return "";
-  return t.replace(/\([^)]*\)/g, "").replace(/✏️/g, "").replace(/\s+/g, " ").trim();
+  // Strip markdown + emoji so the voice speaks natural words, not "asterisk
+  // asterisk title". Parenthetical glosses / romanizations stay visual-only.
+  t = t
+    .replace(/```[\s\S]*?```/g, " ")            // fenced code
+    .replace(/`([^`]+)`/g, "$1")                // inline code
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")      // images
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")    // links → label
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")         // # headers
+    .replace(/^\s*>\s?/gm, "")                  // > blockquotes
+    .replace(/^\s*[-*+]\s+/gm, "")              // bullets
+    .replace(/^\s*\d+[.)]\s+/gm, "")            // numbered lists
+    .replace(/\*\*([^*]+)\*\*/g, "$1")          // **bold**
+    .replace(/__([^_]+)__/g, "$1")              // __bold__
+    .replace(/\*([^*]+)\*/g, "$1")              // *italic*
+    .replace(/~~([^~]+)~~/g, "$1")              // ~~strike~~
+    .replace(/[*_#`>~|]/g, "")                  // any stray markdown chars
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}]/gu, "") // emoji (not CJK)
+    .replace(/\([^)]*\)/g, "")                  // glosses / romanization (eyes only)
+    .replace(/\s+/g, " ")
+    .trim();
+  return t;
 }
 function pumpVoiceSentences(answer, done){
   const rest = answer.slice(voiceSpokenLen);
